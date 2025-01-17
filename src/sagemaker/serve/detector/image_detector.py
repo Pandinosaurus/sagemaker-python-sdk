@@ -1,4 +1,5 @@
 """Detects the image to deploy model"""
+
 from __future__ import absolute_import
 from typing import Tuple, List
 import platform
@@ -42,7 +43,7 @@ def auto_detect_container(model, region: str, instance_type: str) -> str:
     casted_versions = _cast_to_compatible_version(fw, fw_version) if fw_version else (None,)
     dlc = None
 
-    for casted_version in casted_versions:
+    for casted_version in filter(None, casted_versions):
         try:
             dlc = image_uris.retrieve(
                 framework=fw,

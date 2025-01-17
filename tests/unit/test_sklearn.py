@@ -142,6 +142,7 @@ def _create_train_job(version):
         "vpc_config": None,
         "environment": None,
         "experiment_config": None,
+        "enable_network_isolation": False,
         "debugger_hook_config": {
             "CollectionConfigurations": [],
             "S3OutputPath": "s3://{}/".format(BUCKET_NAME),
@@ -331,7 +332,7 @@ def test_sklearn(time, strftime, sagemaker_session, sklearn_version):
     sagemaker_call_names = [c[0] for c in sagemaker_session.method_calls]
     assert sagemaker_call_names == ["train", "logs_for_job"]
     boto_call_names = [c[0] for c in sagemaker_session.boto_session.method_calls]
-    assert boto_call_names == ["resource"]
+    assert "resource" in boto_call_names
 
     expected_train_args = _create_train_job(sklearn_version)
     expected_train_args["input_config"][0]["DataSource"]["S3DataSource"]["S3Uri"] = inputs

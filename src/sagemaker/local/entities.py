@@ -213,6 +213,10 @@ class _LocalTrainingJob(object):
             hyperparameters (dict): The HyperParameters for the training job.
             environment (dict): The collection of environment variables passed to the job.
             job_name (str): Name of the local training job being run.
+
+        Raises:
+            ValueError: If the input data configuration is not valid.
+            RuntimeError: If the data distribution type is not supported.
         """
         for channel in input_data_config:
             if channel["DataSource"] and "S3DataSource" in channel["DataSource"]:
@@ -233,10 +237,12 @@ class _LocalTrainingJob(object):
             # use a single Data URI - this makes handling S3 and File Data easier down the stack
             channel["DataUri"] = data_uri
 
-            if data_distribution and data_distribution != "FullyReplicated":
+            supported_distributions = ["FullyReplicated"]
+            if data_distribution and data_distribution not in supported_distributions:
                 raise RuntimeError(
-                    "DataDistribution: %s is not currently supported in Local Mode"
-                    % data_distribution
+                    "Invalid DataDistribution: '{}'. Local mode currently supports: {}.".format(
+                        data_distribution, ", ".join(supported_distributions)
+                    )
                 )
 
         self.start_time = datetime.datetime.now()
@@ -832,7 +838,7 @@ class _LocalPipelineExecution(object):
         merged_parameters = {}
         default_parameters = {parameter.name: parameter for parameter in self.pipeline.parameters}
         if overridden_parameters is not None:
-            for (param_name, param_value) in overridden_parameters.items():
+            for param_name, param_value in overridden_parameters.items():
                 if param_name not in default_parameters:
                     error_msg = self._construct_validation_exception_message(
                         "Unknown parameter '{}'".format(param_name)

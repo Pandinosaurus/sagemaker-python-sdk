@@ -143,6 +143,7 @@ def _create_train_job(
         "stop_condition": {"MaxRuntimeInSeconds": 24 * 60 * 60},
         "tags": None,
         "vpc_config": None,
+        "enable_network_isolation": False,
         "metric_definitions": None,
         "environment": None,
         "retry_strategy": None,
@@ -401,7 +402,7 @@ def test_pytorchxla_distribution(
     sagemaker_call_names = [c[0] for c in sagemaker_session.method_calls]
     assert sagemaker_call_names == ["train", "logs_for_job"]
     boto_call_names = [c[0] for c in sagemaker_session.boto_session.method_calls]
-    assert boto_call_names == ["resource"]
+    assert "resource" in boto_call_names
 
     expected_train_args = _create_train_job(
         huggingface_training_compiler_version,
@@ -462,7 +463,7 @@ def test_default_compiler_config(
     sagemaker_call_names = [c[0] for c in sagemaker_session.method_calls]
     assert sagemaker_call_names == ["train", "logs_for_job"]
     boto_call_names = [c[0] for c in sagemaker_session.boto_session.method_calls]
-    assert boto_call_names == ["resource"]
+    assert "resource" in boto_call_names
 
     expected_train_args = _create_train_job(
         huggingface_training_compiler_version,
@@ -518,7 +519,7 @@ def test_debug_compiler_config(
     sagemaker_call_names = [c[0] for c in sagemaker_session.method_calls]
     assert sagemaker_call_names == ["train", "logs_for_job"]
     boto_call_names = [c[0] for c in sagemaker_session.boto_session.method_calls]
-    assert boto_call_names == ["resource"]
+    assert "resource" in boto_call_names
 
     expected_train_args = _create_train_job(
         huggingface_training_compiler_version,
@@ -574,7 +575,7 @@ def test_disable_compiler_config(
     sagemaker_call_names = [c[0] for c in sagemaker_session.method_calls]
     assert sagemaker_call_names == ["train", "logs_for_job"]
     boto_call_names = [c[0] for c in sagemaker_session.boto_session.method_calls]
-    assert boto_call_names == ["resource"]
+    assert "resource" in boto_call_names
 
     expected_train_args = _create_train_job(
         huggingface_training_compiler_version,

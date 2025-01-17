@@ -16,6 +16,7 @@ from typing import Optional, Set
 from unittest import mock
 import unittest
 from inspect import signature
+from mock import Mock
 
 import pytest
 from sagemaker.async_inference.async_inference_config import AsyncInferenceConfig
@@ -30,20 +31,27 @@ from sagemaker.jumpstart.artifacts.hyperparameters import _retrieve_default_hype
 from sagemaker.jumpstart.artifacts.metric_definitions import (
     _retrieve_default_training_metric_definitions,
 )
-from sagemaker.jumpstart.constants import DEFAULT_JUMPSTART_SAGEMAKER_SESSION
-from sagemaker.jumpstart.enums import JumpStartScriptScope, JumpStartTag
+from sagemaker.jumpstart.constants import (
+    DEFAULT_JUMPSTART_SAGEMAKER_SESSION,
+    JUMPSTART_DEFAULT_REGION_NAME,
+)
+from sagemaker.jumpstart.enums import JumpStartScriptScope, JumpStartTag, JumpStartModelType
 
 from sagemaker.jumpstart.estimator import JumpStartEstimator
 
 from sagemaker.jumpstart.utils import get_jumpstart_content_bucket
+from sagemaker.session import Session
 from sagemaker.session_settings import SessionSettings
 from tests.integ.sagemaker.jumpstart.utils import get_training_dataset_for_model_and_version
 from sagemaker.model import Model
 from sagemaker.predictor import Predictor
 from tests.unit.sagemaker.jumpstart.utils import (
+    get_prototype_manifest,
+    get_prototype_spec_with_configs,
     get_special_model_spec,
     overwrite_dictionary,
 )
+import boto3
 
 
 execution_role = "fake role! do not use!"
@@ -60,9 +68,14 @@ class EstimatorTest(unittest.TestCase):
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_LOGGER")
     @mock.patch("sagemaker.jumpstart.factory.model.JUMPSTART_LOGGER")
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch("sagemaker.jumpstart.utils.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -75,14 +88,15 @@ class EstimatorTest(unittest.TestCase):
         mock_estimator_fit: mock.Mock,
         mock_estimator_init: mock.Mock,
         mock_get_model_specs: mock.Mock,
+        mock_get_model_type: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_sagemaker_timestamp: mock.Mock,
         mock_jumpstart_model_factory_logger: mock.Mock,
         mock_jumpstart_estimator_factory_logger: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_sagemaker_timestamp.return_value = "9876"
 
@@ -91,6 +105,8 @@ class EstimatorTest(unittest.TestCase):
         model_id, model_version = "js-trainable-model", "*"
 
         mock_get_model_specs.side_effect = get_special_model_spec
+
+        mock_get_model_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_session_estimator.return_value = sagemaker_session
         mock_session_model.return_value = sagemaker_session
@@ -182,9 +198,14 @@ class EstimatorTest(unittest.TestCase):
             ],
         )
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.utils.sagemaker_timestamp")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -199,11 +220,14 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
+        mock_sagemaker_timestamp: mock.Mock,
     ):
+        mock_sagemaker_timestamp.return_value = "8675309"
+
         mock_estimator_deploy.return_value = default_predictor
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-trainable-model-prepacked", "*"
 
@@ -219,32 +243,71 @@ class EstimatorTest(unittest.TestCase):
         mock_estimator_init.assert_called_once_with(
             instance_type="ml.p3.16xlarge",
             instance_count=1,
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/huggingface-pytorch-training:1.10.2"
-            "-transformers4.17.0-gpu-py38-cu113-ubuntu20.04",
-            model_uri="s3://jumpstart-cache-prod-us-west-2/huggingface-training/train-huggingface"
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/huggingface"
+            "-pytorch-training:2.0.0-transformers4.28.1-gpu-py310-cu118-ubuntu20.04",
+            model_uri="s3://jumpstart-cache-prod-us-west-2/huggingface-training"
+            "/train-huggingface"
             "-text2text-flan-t5-base.tar.gz",
-            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/huggingface/"
-            "transfer_learning/text2text/prepack/v1.0.1/sourcedir.tar.gz",
+            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs"
+            "/huggingface/transfer_learning/text2text/prepack/v2.0.0/sourcedir.tar.gz",
             entry_point="transfer_learning.py",
             hyperparameters={
                 "epochs": "1",
+                "max_steps": "-1",
                 "seed": "42",
                 "batch_size": "64",
                 "learning_rate": "0.0001",
+                "lr_scheduler_type": "constant_with_warmup",
+                "warmup_ratio": "0.0",
+                "warmup_steps": "0",
                 "validation_split_ratio": "0.05",
                 "train_data_split_seed": "0",
+                "max_train_samples": "-1",
+                "max_eval_samples": "-1",
+                "max_input_length": "-1",
+                "max_output_length": "128",
+                "pad_to_max_length": "True",
+                "gradient_accumulation_steps": "1",
+                "weight_decay": "0.0",
+                "adam_beta1": "0.9",
+                "adam_beta2": "0.999",
+                "adam_epsilon": "1e-08",
+                "max_grad_norm": "1.0",
+                "load_best_model_at_end": "True",
+                "early_stopping_patience": "3",
+                "early_stopping_threshold": "0.0",
+                "label_smoothing_factor": "0",
+                "logging_strategy": "steps",
+                "logging_first_step": "False",
+                "logging_steps": "500",
+                "logging_nan_inf_filter": "True",
+                "save_strategy": "epoch",
+                "save_steps": "500",
+                "save_total_limit": "2",
+                "dataloader_drop_last": "False",
+                "dataloader_num_workers": "0",
+                "evaluation_strategy": "epoch",
+                "eval_steps": "500",
+                "eval_accumulation_steps": "None",
+                "gradient_checkpointing": "True",
+                "auto_find_batch_size": "False",
+                "preprocessing_num_workers": "None",
+                "peft_type": "none",
             },
             metric_definitions=[
                 {"Name": "huggingface-text2text:eval-loss", "Regex": "'eval_loss': ([0-9\\.]+)"}
             ],
             role=execution_role,
-            encrypt_inter_container_traffic=False,
+            encrypt_inter_container_traffic=True,
             sagemaker_session=sagemaker_session,
-            enable_network_isolation=False,
+            enable_network_isolation=True,
             tags=[
                 {"Key": JumpStartTag.MODEL_ID, "Value": "js-trainable-model-prepacked"},
-                {"Key": JumpStartTag.MODEL_VERSION, "Value": "1.2.0"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "2.2.3"},
             ],
+            volume_size=512,
+            max_run=360000,
+            disable_output_compression=True,
         )
 
         channels = {
@@ -254,37 +317,51 @@ class EstimatorTest(unittest.TestCase):
 
         estimator.fit(channels)
 
-        mock_estimator_fit.assert_called_once_with(inputs=channels, wait=True)
+        mock_estimator_fit.assert_called_once_with(
+            inputs=channels, wait=True, job_name="hf-text2text-flan-t5-base-8675309"
+        )
 
         estimator.deploy()
 
         mock_estimator_deploy.assert_called_once_with(
-            instance_type="ml.g5.xlarge",
+            instance_type="ml.g5.2xlarge",
             initial_instance_count=1,
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/huggingface-pytorch-inference:"
-            "1.10.2-transformers4.17.0-gpu-py38-cu113-ubuntu20.04",
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/"
+            "huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04",
             env={
                 "SAGEMAKER_PROGRAM": "inference.py",
                 "ENDPOINT_SERVER_TIMEOUT": "3600",
                 "MODEL_CACHE_ROOT": "/opt/ml/model",
                 "SAGEMAKER_ENV": "1",
+                "HF_MODEL_ID": "/opt/ml/model",
+                "SM_NUM_GPUS": "1",
+                "MAX_INPUT_LENGTH": "1024",
+                "MAX_TOTAL_TOKENS": "2048",
                 "SAGEMAKER_MODEL_SERVER_WORKERS": "1",
             },
             predictor_cls=Predictor,
+            endpoint_name="hf-text2text-flan-t5-base-8675309",
             role=execution_role,
             wait=True,
             use_compiled_model=False,
-            enable_network_isolation=False,
+            enable_network_isolation=True,
             tags=[
                 {"Key": JumpStartTag.MODEL_ID, "Value": "js-trainable-model-prepacked"},
-                {"Key": JumpStartTag.MODEL_VERSION, "Value": "1.2.0"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "2.2.3"},
             ],
+            model_data_download_timeout=1200,
+            container_startup_health_check_timeout=1200,
+            model_name="hf-text2text-flan-t5-base-8675309",
         )
 
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -299,14 +376,14 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_timestamp: mock.Mock,
     ):
         mock_estimator_deploy.return_value = default_predictor
 
         mock_timestamp.return_value = "8675309"
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-gated-artifact-trainable-model", "*"
 
@@ -315,39 +392,21 @@ class EstimatorTest(unittest.TestCase):
         mock_session_estimator.return_value = sagemaker_session
         mock_session_model.return_value = sagemaker_session
 
-        JumpStartEstimator(
-            model_id=model_id,
-            environment={
-                "accept_eula": "false",
-                "what am i": "doing",
-                "SageMakerGatedModelS3Uri": "none of your business",
-            },
-        )
-
-        mock_estimator_init.assert_called_once_with(
-            instance_type="ml.p3.2xlarge",
-            instance_count=1,
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/djl-inference:0.21.0-deepspeed0.8.3-cu117",
-            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/"
-            "meta/transfer_learning/textgeneration/v1.0.0/sourcedir.tar.gz",
-            entry_point="transfer_learning.py",
-            role=execution_role,
-            sagemaker_session=sagemaker_session,
-            max_run=360000,
-            enable_network_isolation=True,
-            encrypt_inter_container_traffic=True,
-            environment={
-                "accept_eula": "false",
-                "what am i": "doing",
-                "SageMakerGatedModelS3Uri": "none of your business",
-            },
-            tags=[
-                {
-                    "Key": "sagemaker-sdk:jumpstart-model-id",
-                    "Value": "js-gated-artifact-trainable-model",
+        with pytest.raises(ValueError) as e:
+            JumpStartEstimator(
+                model_id=model_id,
+                environment={
+                    "accept_eula": "false",
+                    "what am i": "doing",
+                    "SageMakerGatedModelS3Uri": "none of your business",
                 },
-                {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "2.0.0"},
-            ],
+            )
+        assert str(e.value) == (
+            "Need to define ‘accept_eula'='true' within Environment. "
+            "Model 'meta-textgeneration-llama-2-7b-f' requires accepting end-user "
+            "license agreement (EULA). See "
+            "https://jumpstart-cache-prod-us-west-2.s3.us-west-2.amazonaws.com/fmhMetadata/eula/llamaEula.txt"
+            " for terms of use."
         )
 
         mock_estimator_init.reset_mock()
@@ -355,12 +414,48 @@ class EstimatorTest(unittest.TestCase):
         estimator = JumpStartEstimator(model_id=model_id, environment={"accept_eula": "true"})
 
         mock_estimator_init.assert_called_once_with(
-            instance_type="ml.p3.2xlarge",
+            instance_type="ml.g5.12xlarge",
             instance_count=1,
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/djl-inference:0.21.0-deepspeed0.8.3-cu117",
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/huggingface-"
+            "pytorch-training:2.0.0-transformers4.28.1-gpu-py310-cu118-ubuntu20.04",
             source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/"
-            "meta/transfer_learning/textgeneration/v1.0.0/sourcedir.tar.gz",
+            "meta/transfer_learning/textgeneration/v1.0.6/sourcedir.tar.gz",
             entry_point="transfer_learning.py",
+            hyperparameters={
+                "int8_quantization": "False",
+                "enable_fsdp": "True",
+                "epoch": "1",
+                "learning_rate": "0.0001",
+                "lora_r": "8",
+                "lora_alpha": "32",
+                "lora_dropout": "0.05",
+                "instruction_tuned": "False",
+                "chat_dataset": "True",
+                "add_input_output_demarcation_key": "True",
+                "per_device_train_batch_size": "1",
+                "per_device_eval_batch_size": "1",
+                "max_train_samples": "-1",
+                "max_val_samples": "-1",
+                "seed": "10",
+                "max_input_length": "-1",
+                "validation_split_ratio": "0.2",
+                "train_data_split_seed": "0",
+                "preprocessing_num_workers": "None",
+            },
+            metric_definitions=[
+                {
+                    "Name": "huggingface-textgeneration:eval-loss",
+                    "Regex": "eval_epoch_loss=tensor\\(([0-9\\.]+)",
+                },
+                {
+                    "Name": "huggingface-textgeneration:eval-ppl",
+                    "Regex": "eval_ppl=tensor\\(([0-9\\.]+)",
+                },
+                {
+                    "Name": "huggingface-textgeneration:train-loss",
+                    "Regex": "train_epoch_loss=([0-9\\.]+)",
+                },
+            ],
             role=execution_role,
             sagemaker_session=sagemaker_session,
             max_run=360000,
@@ -368,14 +463,15 @@ class EstimatorTest(unittest.TestCase):
             encrypt_inter_container_traffic=True,
             environment={
                 "accept_eula": "true",
-                "SageMakerGatedModelS3Uri": "s3://jumpstart-cache-alpha-us-west-2/dummy.tar.gz",
+                "SageMakerGatedModelS3Uri": "s3://sagemaker-repository-pdx/"
+                "model-data-model-package_llama2-7b-f-v4-71eeccf76ddf33f2a18d2e16b9c7f302",
             },
             tags=[
                 {
                     "Key": "sagemaker-sdk:jumpstart-model-id",
                     "Value": "js-gated-artifact-trainable-model",
                 },
-                {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "2.0.0"},
+                {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "2.0.4"},
             ],
         )
 
@@ -397,7 +493,7 @@ class EstimatorTest(unittest.TestCase):
             initial_instance_count=1,
             predictor_cls=Predictor,
             endpoint_name="meta-textgeneration-llama-2-7b-f-8675309",
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/djl-inference:0.21.0-deepspeed0.8.3-cu117",
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/djl-inference:0.23.0-deepspeed0.9.5-cu118",
             wait=True,
             model_data_download_timeout=3600,
             container_startup_health_check_timeout=3600,
@@ -410,7 +506,7 @@ class EstimatorTest(unittest.TestCase):
                     "Key": "sagemaker-sdk:jumpstart-model-id",
                     "Value": "js-gated-artifact-trainable-model",
                 },
-                {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "2.0.0"},
+                {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "2.0.4"},
             ],
         )
 
@@ -418,9 +514,13 @@ class EstimatorTest(unittest.TestCase):
         "sagemaker.jumpstart.artifacts.environment_variables.get_jumpstart_gated_content_bucket"
     )
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -435,7 +535,7 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_timestamp: mock.Mock,
         mock_get_jumpstart_gated_content_bucket: mock.Mock,
     ):
@@ -444,7 +544,7 @@ class EstimatorTest(unittest.TestCase):
         mock_get_jumpstart_gated_content_bucket.return_value = "top-secret-private-models-bucket"
         mock_timestamp.return_value = "8675309"
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-gated-artifact-non-model-package-trainable-model", "*"
 
@@ -566,9 +666,13 @@ class EstimatorTest(unittest.TestCase):
         )
 
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -583,14 +687,12 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_timestamp: mock.Mock,
     ):
         mock_estimator_deploy.return_value = default_predictor
 
         mock_timestamp.return_value = "8675309"
-
-        mock_is_valid_model_id.return_value = True
 
         model_id, _ = "js-gated-artifact-trainable-model", "*"
 
@@ -599,16 +701,18 @@ class EstimatorTest(unittest.TestCase):
         mock_session_estimator.return_value = sagemaker_session
         mock_session_model.return_value = sagemaker_session
 
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
+
         with pytest.raises(ValueError) as e:
             JumpStartEstimator(model_id=model_id, region="eu-north-1")
 
         assert (
             str(e.value) == "Model package artifact s3 uri for 'js-gated-artifact-trainable-model' "
             "not supported in eu-north-1. Please try one of the following regions: "
-            "us-west-2, us-east-1, eu-west-1, ap-southeast-1."
+            "us-west-2, us-east-2, us-east-1, eu-west-1, ap-southeast-1, ap-southeast-2."
         )
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -621,10 +725,10 @@ class EstimatorTest(unittest.TestCase):
         mock_estimator_fit: mock.Mock,
         mock_estimator_init: mock.Mock,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "deprecated_model", "*"
 
@@ -642,7 +746,7 @@ class EstimatorTest(unittest.TestCase):
 
         JumpStartEstimator(model_id=model_id, tolerate_deprecated_model=True).fit(channels).deploy()
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -655,9 +759,9 @@ class EstimatorTest(unittest.TestCase):
         mock_estimator_fit: mock.Mock,
         mock_estimator_init: mock.Mock,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
         model_id, _ = "vulnerable_model", "*"
 
         mock_get_model_specs.side_effect = get_special_model_spec
@@ -688,7 +792,6 @@ class EstimatorTest(unittest.TestCase):
             "input_mode": "File",
             "output_path": "Optional[Union[str, PipelineVariable]] = None",
             "output_kms_key": "Optional[Union[str, PipelineVariable]] = None",
-            "base_job_name": "Optional[str] = None",
             "sagemaker_session": DEFAULT_JUMPSTART_SAGEMAKER_SESSION,
             "hyperparameters": {"hyp1": "val1"},
             "tags": [],
@@ -758,9 +861,13 @@ class EstimatorTest(unittest.TestCase):
     @mock.patch("sagemaker.jumpstart.factory.estimator.metric_definitions_utils.retrieve_default")
     @mock.patch("sagemaker.jumpstart.factory.estimator.environment_variables.retrieve_default")
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -775,7 +882,7 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_timestamp: mock.Mock,
         mock_retrieve_default_environment_variables: mock.Mock,
         mock_retrieve_metric_definitions: mock.Mock,
@@ -806,7 +913,7 @@ class EstimatorTest(unittest.TestCase):
 
         mock_estimator_deploy.return_value = default_predictor
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, model_version = "js-trainable-model", "*"
 
@@ -908,16 +1015,16 @@ class EstimatorTest(unittest.TestCase):
 
         mock_estimator_deploy.assert_called_once_with(**expected_deploy_kwargs)
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
     def test_jumpstart_estimator_tags_disabled(
         self,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-trainable-model-prepacked", "*"
 
@@ -947,16 +1054,16 @@ class EstimatorTest(unittest.TestCase):
             [{"Key": "blah", "Value": "blahagain"}],
         )
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
     def test_jumpstart_estimator_tags(
         self,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-trainable-model-prepacked", "*"
 
@@ -979,7 +1086,7 @@ class EstimatorTest(unittest.TestCase):
 
         js_tags = [
             {"Key": "sagemaker-sdk:jumpstart-model-id", "Value": "js-trainable-model-prepacked"},
-            {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "1.2.0"},
+            {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "2.2.3"},
         ]
 
         self.assertEqual(
@@ -988,23 +1095,63 @@ class EstimatorTest(unittest.TestCase):
         )
 
     @mock.patch("sagemaker.jumpstart.estimator.JumpStartEstimator._attach")
-    @mock.patch("sagemaker.jumpstart.estimator.get_model_id_version_from_training_job")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_jumpstart_estimator_attach_eula_model(
+        self,
+        mock_get_model_specs: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
+        mock_attach: mock.Mock,
+    ):
+
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
+
+        mock_get_model_specs.side_effect = get_special_model_spec
+
+        mock_session = mock.MagicMock(sagemaker_config={}, boto_region_name="us-west-2")
+
+        JumpStartEstimator.attach(
+            training_job_name="some-training-job-name",
+            model_id="gemma-model",
+            sagemaker_session=mock_session,
+        )
+
+        mock_attach.assert_called_once_with(
+            training_job_name="some-training-job-name",
+            sagemaker_session=mock_session,
+            model_channel_name="model",
+            additional_kwargs={
+                "model_id": "gemma-model",
+                "model_version": "*",
+                "tolerate_vulnerable_model": True,
+                "tolerate_deprecated_model": True,
+                "environment": {"accept_eula": "true"},
+                "tolerate_vulnerable_model": True,
+                "tolerate_deprecated_model": True,
+            },
+        )
+
+    @mock.patch("sagemaker.jumpstart.estimator.JumpStartEstimator._attach")
+    @mock.patch("sagemaker.jumpstart.estimator.get_model_info_from_training_job")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
     def test_jumpstart_estimator_attach_no_model_id_happy_case(
         self,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
-        get_model_id_version_from_training_job: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
+        get_model_info_from_training_job: mock.Mock,
         mock_attach: mock.Mock,
     ):
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
-        get_model_id_version_from_training_job.return_value = (
+        get_model_info_from_training_job.return_value = (
             "js-trainable-model-prepacked",
             "1.0.0",
+            None,
+            None,
         )
 
         mock_get_model_specs.side_effect = get_special_model_spec
@@ -1015,7 +1162,7 @@ class EstimatorTest(unittest.TestCase):
             training_job_name="some-training-job-name", sagemaker_session=mock_session
         )
 
-        get_model_id_version_from_training_job.assert_called_once_with(
+        get_model_info_from_training_job.assert_called_once_with(
             training_job_name="some-training-job-name",
             sagemaker_session=mock_session,
         )
@@ -1027,25 +1174,27 @@ class EstimatorTest(unittest.TestCase):
             additional_kwargs={
                 "model_id": "js-trainable-model-prepacked",
                 "model_version": "1.0.0",
+                "tolerate_vulnerable_model": True,
+                "tolerate_deprecated_model": True,
             },
         )
 
     @mock.patch("sagemaker.jumpstart.estimator.JumpStartEstimator._attach")
-    @mock.patch("sagemaker.jumpstart.estimator.get_model_id_version_from_training_job")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.get_model_info_from_training_job")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
     def test_jumpstart_estimator_attach_no_model_id_sad_case(
         self,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
-        get_model_id_version_from_training_job: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
+        get_model_info_from_training_job: mock.Mock,
         mock_attach: mock.Mock,
     ):
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
-        get_model_id_version_from_training_job.side_effect = ValueError()
+        get_model_info_from_training_job.side_effect = ValueError()
 
         mock_get_model_specs.side_effect = get_special_model_spec
 
@@ -1056,7 +1205,7 @@ class EstimatorTest(unittest.TestCase):
                 training_job_name="some-training-job-name", sagemaker_session=mock_session
             )
 
-        get_model_id_version_from_training_job.assert_called_once_with(
+        get_model_info_from_training_job.assert_called_once_with(
             training_job_name="some-training-job-name",
             sagemaker_session=mock_session,
         )
@@ -1064,7 +1213,6 @@ class EstimatorTest(unittest.TestCase):
         mock_attach.assert_not_called()
 
     def test_jumpstart_estimator_kwargs_match_parent_class(self):
-
         """If you add arguments to <Estimator constructor>, this test will fail.
         Please add the new argument to the skip set below,
         and reach out to JumpStart team."""
@@ -1084,6 +1232,8 @@ class EstimatorTest(unittest.TestCase):
             "region",
             "tolerate_vulnerable_model",
             "tolerate_deprecated_model",
+            "config_name",
+            "hub_name",
         }
         assert parent_class_init_args - js_class_init_args == init_args_to_skip
 
@@ -1105,34 +1255,42 @@ class EstimatorTest(unittest.TestCase):
         js_class_deploy = JumpStartEstimator.deploy
         js_class_deploy_args = set(signature(js_class_deploy).parameters.keys())
 
-        assert js_class_deploy_args - parent_class_deploy_args == model_class_init_args - {
+        assert js_class_deploy_args - parent_class_deploy_args - {
+            "inference_config_name"
+        } == model_class_init_args - {
             "model_data",
+            "additional_model_data_sources",
             "self",
             "name",
             "resources",
+            "model_reference_arn",
         }
         assert parent_class_deploy_args - js_class_deploy_args == deploy_args_to_skip
 
     @mock.patch("sagemaker.jumpstart.estimator.get_init_kwargs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    def test_is_valid_model_id(
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    def test_validate_model_id_and_get_type(
         self,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_init: mock.Mock,
         mock_get_init_kwargs: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
         JumpStartEstimator(model_id="valid_model_id")
 
-        mock_is_valid_model_id.return_value = False
+        mock_validate_model_id_and_get_type.return_value = False
         with pytest.raises(ValueError):
             JumpStartEstimator(model_id="invalid_model_id")
 
     @mock.patch("sagemaker.jumpstart.estimator.get_default_predictor")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1147,14 +1305,14 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_get_default_predictor: mock.Mock,
     ):
         mock_estimator_deploy.return_value = default_predictor
 
         mock_get_default_predictor.return_value = default_predictor_with_presets
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-trainable-model-prepacked", "*"
 
@@ -1184,14 +1342,20 @@ class EstimatorTest(unittest.TestCase):
             tolerate_deprecated_model=False,
             tolerate_vulnerable_model=False,
             sagemaker_session=estimator.sagemaker_session,
+            config_name=None,
+            hub_arn=None,
         )
         self.assertEqual(type(predictor), Predictor)
         self.assertEqual(predictor, default_predictor_with_presets)
 
     @mock.patch("sagemaker.jumpstart.estimator.get_default_predictor")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1206,14 +1370,14 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_get_default_predictor: mock.Mock,
     ):
         mock_estimator_deploy.return_value = default_predictor
 
         mock_get_default_predictor.return_value = default_predictor_with_presets
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-trainable-model-prepacked", "*"
 
@@ -1239,9 +1403,13 @@ class EstimatorTest(unittest.TestCase):
         self.assertEqual(type(predictor), Predictor)
 
     @mock.patch("sagemaker.jumpstart.estimator.get_default_predictor")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1256,14 +1424,14 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_get_default_predictor: mock.Mock,
     ):
         mock_estimator_deploy.return_value = default_predictor
 
         mock_get_default_predictor.return_value = default_predictor_with_presets
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "js-trainable-model-prepacked", "*"
 
@@ -1289,11 +1457,15 @@ class EstimatorTest(unittest.TestCase):
         self.assertEqual(type(predictor), Predictor)
         self.assertEqual(predictor, default_predictor)
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.factory.estimator._model_supports_incremental_training")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_LOGGER.warning")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1310,9 +1482,9 @@ class EstimatorTest(unittest.TestCase):
         mock_session_model: mock.Mock,
         mock_logger_warning: mock.Mock,
         mock_supports_incremental_training: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_estimator_deploy.return_value = default_predictor
 
@@ -1341,13 +1513,20 @@ class EstimatorTest(unittest.TestCase):
             tolerate_deprecated_model=False,
             tolerate_vulnerable_model=False,
             sagemaker_session=sagemaker_session,
+            config_name=None,
+            hub_arn=None,
+            model_type=JumpStartModelType.OPEN_WEIGHTS,
         )
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.factory.estimator._model_supports_incremental_training")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_LOGGER.warning")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1364,9 +1543,9 @@ class EstimatorTest(unittest.TestCase):
         mock_session_model: mock.Mock,
         mock_logger_warning: mock.Mock,
         mock_supports_incremental_training: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_estimator_deploy.return_value = default_predictor
 
@@ -1392,12 +1571,19 @@ class EstimatorTest(unittest.TestCase):
             tolerate_deprecated_model=False,
             tolerate_vulnerable_model=False,
             sagemaker_session=sagemaker_session,
+            config_name=None,
+            hub_arn=None,
+            model_type=JumpStartModelType.OPEN_WEIGHTS,
         )
 
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1412,10 +1598,10 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_sagemaker_timestamp: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_sagemaker_timestamp.return_value = "3456"
 
@@ -1455,10 +1641,17 @@ class EstimatorTest(unittest.TestCase):
         estimator.deploy(image_uri="blah")
         assert mock_estimator_deploy.call_args[1]["instance_type"] == "ml.p4de.24xlarge"
 
+        estimator.deploy(image_uri="blah", instance_type="ml.quantum.large")
+        assert mock_estimator_deploy.call_args[1]["instance_type"] == "ml.quantum.large"
+
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix"
+    )
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
@@ -1473,10 +1666,10 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs: mock.Mock,
         mock_session_estimator: mock.Mock,
         mock_session_model: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_sagemaker_timestamp: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_sagemaker_timestamp.return_value = "3456"
 
@@ -1533,12 +1726,13 @@ class EstimatorTest(unittest.TestCase):
         )
 
     @mock.patch("sagemaker.utils.sagemaker_timestamp")
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch(
-        "sagemaker.jumpstart.factory.model.DEFAULT_JUMPSTART_SAGEMAKER_SESSION", sagemaker_session
+        "sagemaker.jumpstart.factory.model.get_default_jumpstart_session_with_user_agent_suffix",
+        lambda *largs, **kwargs: sagemaker_session,
     )
     @mock.patch(
-        "sagemaker.jumpstart.factory.estimator.DEFAULT_JUMPSTART_SAGEMAKER_SESSION",
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix",
         sagemaker_session,
     )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
@@ -1553,10 +1747,10 @@ class EstimatorTest(unittest.TestCase):
         mock_estimator_fit: mock.Mock,
         mock_estimator_init: mock.Mock,
         mock_get_model_specs: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
         mock_sagemaker_timestamp: mock.Mock,
     ):
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         mock_sagemaker_timestamp.return_value = "3456"
 
@@ -1567,7 +1761,8 @@ class EstimatorTest(unittest.TestCase):
         mock_get_model_specs.side_effect = get_special_model_spec
 
         mock_role = f"dsfsdfsd{time.time()}"
-        mock_sagemaker_session = mock.MagicMock(sagemaker_config={})
+        region = "us-west-2"
+        mock_sagemaker_session = mock.MagicMock(sagemaker_config={}, boto_region_name=region)
         mock_sagemaker_session.get_caller_identity_arn = lambda: mock_role
 
         estimator = JumpStartEstimator(
@@ -1611,11 +1806,13 @@ class EstimatorTest(unittest.TestCase):
             ],
         )
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.deploy")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.factory.estimator._retrieve_estimator_init_kwargs")
-    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.JumpStartModelsAccessor.reset_cache")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
@@ -1627,11 +1824,11 @@ class EstimatorTest(unittest.TestCase):
         mock_retrieve_kwargs: mock.Mock,
         mock_estimator_init: mock.Mock,
         mock_estimator_deploy: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
         mock_estimator_deploy.return_value = default_predictor
 
-        mock_is_valid_model_id.side_effect = [False, False]
+        mock_validate_model_id_and_get_type.side_effect = [False, False]
 
         model_id, _ = "js-trainable-model", "*"
 
@@ -1647,7 +1844,7 @@ class EstimatorTest(unittest.TestCase):
             )
 
         mock_reset_cache.assert_called_once_with()
-        mock_is_valid_model_id.assert_has_calls(
+        mock_validate_model_id_and_get_type.assert_has_calls(
             calls=[
                 mock.call(
                     model_id="js-trainable-model",
@@ -1655,6 +1852,7 @@ class EstimatorTest(unittest.TestCase):
                     region=None,
                     script=JumpStartScriptScope.TRAINING,
                     sagemaker_session=None,
+                    hub_arn=None,
                 ),
                 mock.call(
                     model_id="js-trainable-model",
@@ -1662,20 +1860,21 @@ class EstimatorTest(unittest.TestCase):
                     region=None,
                     script=JumpStartScriptScope.TRAINING,
                     sagemaker_session=None,
+                    hub_arn=None,
                 ),
             ]
         )
 
-        mock_is_valid_model_id.reset_mock()
+        mock_validate_model_id_and_get_type.reset_mock()
         mock_reset_cache.reset_mock()
 
-        mock_is_valid_model_id.side_effect = [False, True]
+        mock_validate_model_id_and_get_type.side_effect = [False, True]
         JumpStartEstimator(
             model_id=model_id,
         )
 
         mock_reset_cache.assert_called_once_with()
-        mock_is_valid_model_id.assert_has_calls(
+        mock_validate_model_id_and_get_type.assert_has_calls(
             calls=[
                 mock.call(
                     model_id="js-trainable-model",
@@ -1683,6 +1882,7 @@ class EstimatorTest(unittest.TestCase):
                     region=None,
                     script=JumpStartScriptScope.TRAINING,
                     sagemaker_session=None,
+                    hub_arn=None,
                 ),
                 mock.call(
                     model_id="js-trainable-model",
@@ -1690,12 +1890,15 @@ class EstimatorTest(unittest.TestCase):
                     region=None,
                     script=JumpStartScriptScope.TRAINING,
                     sagemaker_session=None,
+                    hub_arn=None,
                 ),
             ]
         )
 
-    @mock.patch("sagemaker.jumpstart.estimator.is_valid_model_id")
-    @mock.patch("sagemaker.jumpstart.factory.model.Session")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch(
+        "sagemaker.jumpstart.factory.estimator.get_default_jumpstart_session_with_user_agent_suffix"
+    )
     @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
     @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
     @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
@@ -1704,10 +1907,10 @@ class EstimatorTest(unittest.TestCase):
         mock_estimator_init: mock.Mock,
         mock_get_model_specs: mock.Mock,
         mock_session: mock.Mock,
-        mock_is_valid_model_id: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
     ):
 
-        mock_is_valid_model_id.return_value = True
+        mock_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
         model_id, _ = "model-artifact-variant-model", "*"
 
@@ -1716,60 +1919,434 @@ class EstimatorTest(unittest.TestCase):
         mock_session.return_value = sagemaker_session
 
         # this instance type has a special model artifact
-        JumpStartEstimator(model_id=model_id, instance_type="ml.p2.xlarge")
+        JumpStartEstimator(model_id=model_id, instance_type="ml.m5.xlarge")
 
         mock_estimator_init.assert_called_once_with(
-            instance_type="ml.p2.xlarge",
+            instance_type="ml.m5.xlarge",
             instance_count=1,
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/huggingface-pytorch-inference:1.13.1"
-            "-transformers4.26.0-gpu-py39-cu117-ubuntu20.04",
-            model_uri="s3://jumpstart-cache-prod-us-west-2/hello-mars-1",
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:1.10.0-cpu-py38",
+            model_uri="s3://jumpstart-cache-prod-us-west-2/hello-world-1",
             source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/"
-            "pytorch/transfer_learning/ic/v1.0.0/sourcedir.tar.gz",
+            "pytorch/transfer_learning/ic/prepack/v1.1.0/sourcedir.tar.gz",
             entry_point="transfer_learning.py",
-            hyperparameters={"epochs": "3", "adam-learning-rate": "0.05", "batch-size": "4"},
+            hyperparameters={
+                "train_only_top_layer": "True",
+                "epochs": "5",
+                "learning_rate": "0.001",
+                "batch_size": "4",
+                "reinitialize_top_layer": "Auto",
+            },
             metric_definitions=[
-                {"Regex": "val_accuracy: ([0-9\\.]+)", "Name": "pytorch-ic:val-accuracy"}
+                {"Name": "pytorch-ic:val-accuracy", "Regex": "val_accuracy: ([0-9\\.]+)"}
             ],
             role=execution_role,
             sagemaker_session=sagemaker_session,
-            enable_network_isolation=False,
+            enable_network_isolation=True,
             encrypt_inter_container_traffic=True,
-            volume_size=456,
+            max_run=360000,
             tags=[
                 {"Key": JumpStartTag.MODEL_ID, "Value": "model-artifact-variant-model"},
-                {"Key": JumpStartTag.MODEL_VERSION, "Value": "1.0.0"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "3.0.6"},
             ],
         )
 
         mock_estimator_init.reset_mock()
 
-        JumpStartEstimator(model_id=model_id, instance_type="ml.p99.xlarge")
+        JumpStartEstimator(model_id=model_id, instance_type="ml.p3.2xlarge")
 
         mock_estimator_init.assert_called_once_with(
-            instance_type="ml.p99.xlarge",
+            instance_type="ml.p3.2xlarge",
             instance_count=1,
-            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:1.5.0-gpu-py3",
-            model_uri="s3://jumpstart-cache-prod-us-west-2/pytorch-training/train-pytorch-ic-mobilenet-v2.tar.gz",
-            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/pytorch/"
-            "transfer_learning/ic/v1.0.0/sourcedir.tar.gz",
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training:1.10.0-gpu-py38",
+            model_uri="s3://jumpstart-cache-prod-us-west-2/pytorch-training/"
+            "v2.0.0/train-pytorch-ic-mobilenet-v2.tar.gz",
+            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/"
+            "pytorch/transfer_learning/ic/prepack/v1.1.0/sourcedir.tar.gz",
             entry_point="transfer_learning.py",
-            hyperparameters={"epochs": "3", "adam-learning-rate": "0.05", "batch-size": "4"},
+            hyperparameters={
+                "train_only_top_layer": "True",
+                "epochs": "5",
+                "learning_rate": "0.001",
+                "batch_size": "4",
+                "reinitialize_top_layer": "Auto",
+            },
             metric_definitions=[
-                {"Regex": "val_accuracy: ([0-9\\.]+)", "Name": "pytorch-ic:val-accuracy"}
+                {"Name": "pytorch-ic:val-accuracy", "Regex": "val_accuracy: ([0-9\\.]+)"}
             ],
             role=execution_role,
             sagemaker_session=sagemaker_session,
-            enable_network_isolation=False,
+            enable_network_isolation=True,
             encrypt_inter_container_traffic=True,
-            volume_size=456,
+            max_run=360000,
             tags=[
-                {
-                    "Key": "sagemaker-sdk:jumpstart-model-id",
-                    "Value": "model-artifact-variant-model",
-                },
-                {"Key": "sagemaker-sdk:jumpstart-model-version", "Value": "1.0.0"},
+                {"Key": JumpStartTag.MODEL_ID, "Value": "model-artifact-variant-model"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "3.0.6"},
             ],
+        )
+
+    @mock.patch("sagemaker.jumpstart.estimator.get_default_predictor")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.deploy")
+    @mock.patch("sagemaker.jumpstart.estimator.validate_model_id_and_get_type")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.factory.model.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_jumpstart_estimator_session(
+        self,
+        mock_get_model_specs: mock.Mock,
+        mock_validate_model_id_and_get_type: mock.Mock,
+        mock_deploy,
+        mock_fit,
+        mock_init,
+        get_default_predictor,
+    ):
+
+        mock_validate_model_id_and_get_type.return_value = True
+
+        model_id, _ = "js-trainable-model", "*"
+
+        mock_get_model_specs.side_effect = get_special_model_spec
+
+        region = "eu-west-1"  # some non-default region
+
+        if region == JUMPSTART_DEFAULT_REGION_NAME:
+            region = "us-west-2"
+
+        session = Session(boto_session=boto3.session.Session(region_name=region))
+
+        assert session.boto_region_name != JUMPSTART_DEFAULT_REGION_NAME
+
+        session.get_caller_identity_arn = Mock(return_value="blah")
+
+        estimator = JumpStartEstimator(model_id=model_id, sagemaker_session=session)
+        estimator.fit()
+
+        estimator.deploy()
+
+        assert len(mock_get_model_specs.call_args_list) > 1
+
+        regions = {call[1]["region"] for call in mock_get_model_specs.call_args_list}
+
+        assert len(regions) == 1
+        assert list(regions)[0] == region
+
+        s3_clients = {call[1]["s3_client"] for call in mock_get_model_specs.call_args_list}
+        assert len(s3_clients) == 1
+        assert list(s3_clients)[0] == session.s3_client
+
+    @mock.patch("sagemaker.utils.sagemaker_timestamp")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor._get_manifest")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_estimator_initialization_with_config_name(
+        self,
+        mock_estimator_init: mock.Mock,
+        mock_estimator_fit: mock.Mock,
+        mock_get_model_specs: mock.Mock,
+        mock_session: mock.Mock,
+        mock_get_manifest: mock.Mock,
+        mock_sagemaker_timestamp: mock.Mock,
+    ):
+
+        mock_sagemaker_timestamp.return_value = "8675309"
+
+        mock_get_model_specs.side_effect = get_prototype_spec_with_configs
+        mock_get_manifest.side_effect = (
+            lambda region, model_type, *args, **kwargs: get_prototype_manifest(region, model_type)
+        )
+        mock_estimator_fit.return_value = default_predictor
+
+        model_id, _ = "pytorch-ic-mobilenet-v2", "*"
+
+        mock_session.return_value = sagemaker_session
+
+        estimator = JumpStartEstimator(
+            model_id=model_id,
+            config_name="gpu-training",
+        )
+
+        mock_estimator_init.assert_called_with(
+            instance_type="ml.p2.xlarge",
+            instance_count=1,
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/"
+            "huggingface-pytorch-training:1.13.1-neuronx-py310-sdk2.14.1-ubuntu20.04",
+            model_uri="s3://jumpstart-cache-prod-us-west-2/artifacts/"
+            "meta-textgeneration-llama-2-7b/gpu-training/model/",
+            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/"
+            "pytorch/transfer_learning/ic/prepack/v1.1.0/sourcedir.tar.gz",
+            entry_point="transfer_learning.py",
+            hyperparameters={
+                "train_only_top_layer": "True",
+                "epochs": "5",
+                "learning_rate": "0.001",
+                "batch_size": "4",
+                "reinitialize_top_layer": "Auto",
+            },
+            metric_definitions=[
+                {"Name": "pytorch-ic:val-accuracy", "Regex": "val_accuracy: ([0-9\\.]+)"}
+            ],
+            role="fake role! do not use!",
+            max_run=360000,
+            sagemaker_session=estimator.sagemaker_session,
+            tags=[
+                {"Key": JumpStartTag.MODEL_ID, "Value": "pytorch-ic-mobilenet-v2"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "3.0.6"},
+                {"Key": JumpStartTag.TRAINING_CONFIG_NAME, "Value": "gpu-training"},
+            ],
+            enable_network_isolation=True,
+            encrypt_inter_container_traffic=True,
+        )
+
+        estimator.fit()
+
+        mock_estimator_fit.assert_called_once_with(wait=True, job_name="pt-ic-mobilenet-v2-8675309")
+
+    @mock.patch("sagemaker.utils.sagemaker_timestamp")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor._get_manifest")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_estimator_set_config_name(
+        self,
+        mock_estimator_init: mock.Mock,
+        mock_estimator_fit: mock.Mock,
+        mock_get_model_specs: mock.Mock,
+        mock_session: mock.Mock,
+        mock_get_manifest: mock.Mock,
+        mock_sagemaker_timestamp: mock.Mock,
+    ):
+
+        mock_sagemaker_timestamp.return_value = "8675309"
+
+        mock_get_model_specs.side_effect = get_prototype_spec_with_configs
+        mock_get_manifest.side_effect = (
+            lambda region, model_type, *args, **kwargs: get_prototype_manifest(region, model_type)
+        )
+        mock_estimator_fit.return_value = default_predictor
+
+        model_id, _ = "pytorch-ic-mobilenet-v2", "*"
+
+        mock_session.return_value = sagemaker_session
+
+        estimator = JumpStartEstimator(model_id=model_id, config_name="gpu-training")
+
+        estimator.set_training_config(config_name="gpu-training-budget")
+
+        mock_estimator_init.assert_called_with(
+            instance_type="ml.p2.xlarge",
+            instance_count=1,
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/"
+            "pytorch-training:1.13.1-py310-sdk2.14.1-ubuntu20.04",
+            model_uri="s3://jumpstart-cache-prod-us-west-2/artifacts/meta-textgeneration-llama-2-7b/"
+            "gpu-training-budget/model/",
+            source_dir="s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/"
+            "pytorch/transfer_learning/ic/prepack/v1.1.0/sourcedir.tar.gz",
+            entry_point="transfer_learning.py",
+            hyperparameters={
+                "train_only_top_layer": "True",
+                "epochs": "5",
+                "learning_rate": "0.001",
+                "batch_size": "4",
+                "reinitialize_top_layer": "Auto",
+            },
+            metric_definitions=[
+                {"Name": "pytorch-ic:val-accuracy", "Regex": "val_accuracy: ([0-9\\.]+)"}
+            ],
+            role="fake role! do not use!",
+            max_run=360000,
+            sagemaker_session=estimator.sagemaker_session,
+            tags=[
+                {"Key": JumpStartTag.MODEL_ID, "Value": "pytorch-ic-mobilenet-v2"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "3.0.6"},
+                {"Key": JumpStartTag.TRAINING_CONFIG_NAME, "Value": "gpu-training-budget"},
+            ],
+            enable_network_isolation=True,
+            encrypt_inter_container_traffic=True,
+        )
+
+        estimator.fit()
+
+        mock_estimator_fit.assert_called_once_with(wait=True, job_name="pt-ic-mobilenet-v2-8675309")
+
+    @mock.patch("sagemaker.utils.sagemaker_timestamp")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor._get_manifest")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.deploy")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_estimator_default_inference_config(
+        self,
+        mock_estimator_fit: mock.Mock,
+        mock_estimator_deploy: mock.Mock,
+        mock_get_model_specs: mock.Mock,
+        mock_session: mock.Mock,
+        mock_get_manifest: mock.Mock,
+        mock_sagemaker_timestamp: mock.Mock,
+    ):
+        mock_sagemaker_timestamp.return_value = "8675309"
+        mock_estimator_deploy.return_value = default_predictor
+        mock_get_model_specs.side_effect = get_prototype_spec_with_configs
+        mock_get_manifest.side_effect = (
+            lambda region, model_type, *args, **kwargs: get_prototype_manifest(region, model_type)
+        )
+        mock_estimator_fit.return_value = default_predictor
+
+        model_id, _ = "pytorch-ic-mobilenet-v2", "*"
+
+        mock_session.return_value = sagemaker_session
+
+        estimator = JumpStartEstimator(model_id=model_id, config_name="gpu-training")
+
+        assert estimator.config_name == "gpu-training"
+
+        estimator.deploy()
+
+        mock_estimator_deploy.assert_called_once_with(
+            instance_type="ml.m5.large",
+            initial_instance_count=1,
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-inference:1.10.0-cpu-py38",
+            env={
+                "SAGEMAKER_PROGRAM": "inference.py",
+                "ENDPOINT_SERVER_TIMEOUT": "3600",
+                "MODEL_CACHE_ROOT": "/opt/ml/model",
+                "SAGEMAKER_ENV": "1",
+                "SAGEMAKER_MODEL_SERVER_WORKERS": "1",
+            },
+            predictor_cls=Predictor,
+            wait=True,
+            role="fake role! do not use!",
+            use_compiled_model=False,
+            enable_network_isolation=True,
+            tags=[
+                {"Key": JumpStartTag.MODEL_ID, "Value": "pytorch-ic-mobilenet-v2"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "3.0.6"},
+                {"Key": JumpStartTag.INFERENCE_CONFIG_NAME, "Value": "gpu-inference"},
+            ],
+            model_name="pt-ic-mobilenet-v2-8675309",
+            endpoint_name="pt-ic-mobilenet-v2-8675309",
+        )
+
+    @mock.patch("sagemaker.jumpstart.estimator.JumpStartEstimator._attach")
+    @mock.patch("sagemaker.jumpstart.estimator.get_model_info_from_training_job")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor._get_manifest")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_estimator_incremental_training_config(
+        self,
+        mock_estimator_init: mock.Mock,
+        mock_estimator_fit: mock.Mock,
+        mock_get_model_specs: mock.Mock,
+        mock_session: mock.Mock,
+        mock_get_manifest: mock.Mock,
+        mock_get_model_info_from_training_job: mock.Mock,
+        mock_attach: mock.Mock,
+    ):
+        mock_get_model_info_from_training_job.return_value = (
+            "pytorch-ic-mobilenet-v2",
+            "1.0.0",
+            None,
+            "gpu-training-budget",
+        )
+        mock_get_model_specs.side_effect = get_prototype_spec_with_configs
+        mock_get_manifest.side_effect = (
+            lambda region, model_type, *args, **kwargs: get_prototype_manifest(region, model_type)
+        )
+        mock_estimator_fit.return_value = default_predictor
+
+        model_id, _ = "pytorch-ic-mobilenet-v2", "*"
+
+        mock_session.return_value = sagemaker_session
+
+        estimator = JumpStartEstimator(model_id=model_id, config_name="gpu-training")
+
+        assert estimator.config_name == "gpu-training"
+
+        JumpStartEstimator.attach(
+            training_job_name="some-training-job-name", sagemaker_session=mock_session
+        )
+
+        mock_attach.assert_called_once_with(
+            training_job_name="some-training-job-name",
+            sagemaker_session=mock_session,
+            model_channel_name="model",
+            additional_kwargs={
+                "model_id": "pytorch-ic-mobilenet-v2",
+                "model_version": "1.0.0",
+                "tolerate_vulnerable_model": True,
+                "tolerate_deprecated_model": True,
+                "config_name": "gpu-training-budget",
+            },
+        )
+
+    @mock.patch("sagemaker.utils.sagemaker_timestamp")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor._get_manifest")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.Session")
+    @mock.patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.deploy")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.fit")
+    @mock.patch("sagemaker.jumpstart.estimator.Estimator.__init__")
+    @mock.patch("sagemaker.jumpstart.factory.estimator.JUMPSTART_DEFAULT_REGION_NAME", region)
+    def test_estimator_deploy_with_config(
+        self,
+        mock_estimator_init: mock.Mock,
+        mock_estimator_fit: mock.Mock,
+        mock_estimator_deploy: mock.Mock,
+        mock_get_model_specs: mock.Mock,
+        mock_session: mock.Mock,
+        mock_get_manifest: mock.Mock,
+        mock_sagemaker_timestamp: mock.Mock,
+    ):
+
+        mock_sagemaker_timestamp.return_value = "8675309"
+        mock_estimator_deploy.return_value = default_predictor
+        mock_get_model_specs.side_effect = get_prototype_spec_with_configs
+        mock_get_manifest.side_effect = (
+            lambda region, model_type, *args, **kwargs: get_prototype_manifest(region, model_type)
+        )
+        mock_estimator_fit.return_value = default_predictor
+
+        model_id, _ = "pytorch-ic-mobilenet-v2", "*"
+
+        mock_session.return_value = sagemaker_session
+
+        estimator = JumpStartEstimator(model_id=model_id, config_name="gpu-training-budget")
+
+        assert estimator.config_name == "gpu-training-budget"
+
+        estimator.deploy()
+
+        mock_estimator_deploy.assert_called_once_with(
+            instance_type="ml.m5.large",
+            initial_instance_count=1,
+            image_uri="763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-inference:1.10.0-cpu-py38",
+            env={
+                "SAGEMAKER_PROGRAM": "inference.py",
+                "ENDPOINT_SERVER_TIMEOUT": "3600",
+                "MODEL_CACHE_ROOT": "/opt/ml/model",
+                "SAGEMAKER_ENV": "1",
+                "SAGEMAKER_MODEL_SERVER_WORKERS": "1",
+            },
+            predictor_cls=Predictor,
+            wait=True,
+            role="fake role! do not use!",
+            use_compiled_model=False,
+            enable_network_isolation=True,
+            tags=[
+                {"Key": JumpStartTag.MODEL_ID, "Value": "pytorch-ic-mobilenet-v2"},
+                {"Key": JumpStartTag.MODEL_VERSION, "Value": "3.0.6"},
+                {"Key": JumpStartTag.INFERENCE_CONFIG_NAME, "Value": "gpu-inference-budget"},
+            ],
+            model_name="pt-ic-mobilenet-v2-8675309",
+            endpoint_name="pt-ic-mobilenet-v2-8675309",
         )
 
 

@@ -26,12 +26,17 @@ from sagemaker.fw_utils import (
 )
 from sagemaker.metadata_properties import MetadataProperties
 from sagemaker.model import FrameworkModel, MODEL_SERVER_WORKERS_PARAM_NAME
+from sagemaker.model_card import (
+    ModelCard,
+    ModelPackageModelCard,
+)
 from sagemaker.predictor import Predictor
 from sagemaker.serializers import JSONSerializer
 from sagemaker.session import Session
 from sagemaker.utils import to_string, format_tags
 from sagemaker.workflow import is_pipeline_variable
 from sagemaker.workflow.entities import PipelineVariable
+from sagemaker.model_life_cycle import ModelLifeCycle
 
 logger = logging.getLogger("sagemaker")
 
@@ -330,10 +335,7 @@ class HuggingFaceModel(FrameworkModel):
             container_startup_health_check_timeout=container_startup_health_check_timeout,
             inference_recommendation_id=inference_recommendation_id,
             explainer_config=explainer_config,
-            endpoint_logging=kwargs.get("endpoint_logging", False),
-            endpoint_type=kwargs.get("endpoint_type", None),
-            resources=kwargs.get("resources", None),
-            managed_instance_scaling=kwargs.get("managed_instance_scaling", None),
+            **kwargs,
         )
 
     def register(
@@ -360,6 +362,9 @@ class HuggingFaceModel(FrameworkModel):
         nearest_model_name: Optional[Union[str, PipelineVariable]] = None,
         data_input_configuration: Optional[Union[str, PipelineVariable]] = None,
         skip_model_validation: Optional[Union[str, PipelineVariable]] = None,
+        source_uri: Optional[Union[str, PipelineVariable]] = None,
+        model_life_cycle: Optional[ModelLifeCycle] = None,
+        model_card: Optional[Union[ModelPackageModelCard, ModelCard]] = None,
     ):
         """Creates a model package for creating SageMaker models or listing on Marketplace.
 
@@ -410,6 +415,11 @@ class HuggingFaceModel(FrameworkModel):
                 (default: None).
             skip_model_validation (str or PipelineVariable): Indicates if you want to skip model
                 validation. Values can be "All" or "None" (default: None).
+            source_uri (str or PipelineVariable): The URI of the source for the model package
+                (default: None).
+            model_card (ModeCard or ModelPackageModelCard): document contains qualitative and
+                quantitative information about a model (default: None).
+            model_life_cycle (ModelLifeCycle): ModelLifeCycle object (default: None).
 
         Returns:
             A `sagemaker.model.ModelPackage` instance.
@@ -457,6 +467,9 @@ class HuggingFaceModel(FrameworkModel):
             nearest_model_name=nearest_model_name,
             data_input_configuration=data_input_configuration,
             skip_model_validation=skip_model_validation,
+            source_uri=source_uri,
+            model_life_cycle=model_life_cycle,
+            model_card=model_card,
         )
 
     def prepare_container_def(
@@ -466,6 +479,7 @@ class HuggingFaceModel(FrameworkModel):
         serverless_inference_config=None,
         inference_tool=None,
         accept_eula=None,
+        model_reference_arn=None,
     ):
         """A container definition with framework configuration set in model environment variables.
 
@@ -519,7 +533,9 @@ class HuggingFaceModel(FrameworkModel):
             deploy_image,
             self.repacked_model_data or self.model_data,
             deploy_env,
+            image_config=self.image_config,
             accept_eula=accept_eula,
+            model_reference_arn=model_reference_arn,
         )
 
     def serving_image_uri(

@@ -18,12 +18,18 @@
 # and the RegisterModel and CreateModelStep have been replaced with the new interface - ModelStep
 from __future__ import absolute_import
 
+import json
 import logging
 import os
 import re
 
 import pytest
 
+from packaging.version import Version
+from packaging.specifiers import SpecifierSet
+
+from sagemaker.model_card.model_card import ModelCard, ModelOverview, ModelPackageModelCard
+from sagemaker.model_card.schema_constraints import ModelCardStatusEnum
 import tests
 from tests.integ.sagemaker.workflow.helpers import wait_pipeline_execution
 from sagemaker.tensorflow import TensorFlow, TensorFlowModel
@@ -35,7 +41,6 @@ from sagemaker import (
     Model,
     ModelMetrics,
     MetricsSource,
-    get_execution_role,
 )
 from sagemaker import FileSource, utils
 from sagemaker.inputs import CreateModelInput
@@ -57,11 +62,15 @@ from sagemaker.workflow.conditions import (
 )
 from tests.integ.kms_utils import get_or_create_kms_key
 from tests.integ import DATA_DIR
-
-
-@pytest.fixture
-def role(sagemaker_session):
-    return get_execution_role(sagemaker_session)
+from sagemaker.model_card import (
+    IntendedUses,
+    BusinessDetails,
+    EvaluationJob,
+    AdditionalInformation,
+    Metric,
+    MetricGroup,
+    MetricTypeEnum,
+)
 
 
 @pytest.fixture
@@ -69,13 +78,8 @@ def pipeline_name():
     return utils.unique_name_from_base("my-pipeline-model-regis")
 
 
-@pytest.fixture
-def region_name(sagemaker_session):
-    return sagemaker_session.boto_session.region_name
-
-
 def test_conditional_pytorch_training_model_registration(
-    sagemaker_session,
+    sagemaker_session_for_pipeline,
     role,
     cpu_instance_type,
     pipeline_name,
@@ -83,7 +87,7 @@ def test_conditional_pytorch_training_model_registration(
 ):
     base_dir = os.path.join(DATA_DIR, "pytorch_mnist")
     entry_point = os.path.join(base_dir, "mnist.py")
-    input_path = sagemaker_session.upload_data(
+    input_path = sagemaker_session_for_pipeline.upload_data(
         path=os.path.join(base_dir, "training"),
         key_prefix="integ-test-data/pytorch_mnist/training",
     )
@@ -109,7 +113,7 @@ def test_conditional_pytorch_training_model_registration(
         py_version="py3",
         instance_count=instance_count,
         instance_type=instance_type,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
     step_train = TrainingStep(
         name="pytorch-train",
@@ -136,7 +140,7 @@ def test_conditional_pytorch_training_model_registration(
     model = Model(
         image_uri=pytorch_estimator.training_image_uri(),
         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
         role=role,
     )
     model_inputs = CreateModelInput(
@@ -168,7 +172,7 @@ def test_conditional_pytorch_training_model_registration(
             instance_count,
         ],
         steps=[step_train, step_cond],
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     try:
@@ -200,7 +204,7 @@ def test_conditional_pytorch_training_model_registration(
 
 
 def test_mxnet_model_registration(
-    sagemaker_session,
+    sagemaker_session_for_pipeline,
     role,
     cpu_instance_type,
     pipeline_name,
@@ -227,7 +231,7 @@ def test_mxnet_model_registration(
         model_data=mx_mnist_model_data,
         framework_version="1.7.0",
         py_version="py3",
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     step_register = RegisterModel(
@@ -249,7 +253,7 @@ def test_mxnet_model_registration(
         name=pipeline_name,
         parameters=[instance_count, instance_type],
         steps=[step_register],
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     try:
@@ -281,10 +285,10 @@ def test_mxnet_model_registration(
 
 
 def test_sklearn_xgboost_sip_model_registration(
-    sagemaker_session, role, pipeline_name, region_name
+    sagemaker_session_for_pipeline, role, pipeline_name, region_name
 ):
     prefix = "sip"
-    bucket_name = sagemaker_session.default_bucket()
+    bucket_name = sagemaker_session_for_pipeline.default_bucket()
     instance_count = ParameterInteger(name="InstanceCount", default_value=1)
     instance_type = "ml.m5.xlarge"
 
@@ -301,7 +305,7 @@ def test_sklearn_xgboost_sip_model_registration(
         instance_type=instance_type,
         instance_count=instance_count,
         framework_version="0.20.0",
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     # The path to the raw data.
@@ -376,7 +380,7 @@ def test_sklearn_xgboost_sip_model_registration(
         instance_type=instance_type,
         instance_count=instance_count,
         framework_version="0.90-2",
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
         py_version="py3",
         role=role,
     )
@@ -412,7 +416,7 @@ def test_sklearn_xgboost_sip_model_registration(
         source_dir=source_dir,
         code_location=code_location,
         role=role,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
         framework_version="0.20.0",
         py_version="py3",
     )
@@ -429,11 +433,11 @@ def test_sklearn_xgboost_sip_model_registration(
         framework_version="0.90-2",
         py_version="py3",
         role=role,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     pipeline_model = PipelineModel(
-        [xgboost_model, sklearn_model], role, sagemaker_session=sagemaker_session
+        [xgboost_model, sklearn_model], role, sagemaker_session=sagemaker_session_for_pipeline
     )
 
     step_register = RegisterModel(
@@ -462,7 +466,7 @@ def test_sklearn_xgboost_sip_model_registration(
             output_path_param,
         ],
         steps=[processing_step, training_step, step_register],
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     try:
@@ -500,7 +504,7 @@ def test_sklearn_xgboost_sip_model_registration(
     ),
 )
 def test_model_registration_with_drift_check_baselines(
-    sagemaker_session,
+    sagemaker_session_for_pipeline,
     role,
     pipeline_name,
 ):
@@ -510,12 +514,12 @@ def test_model_registration_with_drift_check_baselines(
     # upload model data to s3
     model_local_path = os.path.join(DATA_DIR, "mxnet_mnist/model.tar.gz")
     model_base_uri = "s3://{}/{}/input/model/{}".format(
-        sagemaker_session.default_bucket(),
+        sagemaker_session_for_pipeline.default_bucket(),
         "register_model_test_with_drift_baseline",
         utils.unique_name_from_base("model"),
     )
     model_uri = S3Uploader.upload(
-        model_local_path, model_base_uri, sagemaker_session=sagemaker_session
+        model_local_path, model_base_uri, sagemaker_session=sagemaker_session_for_pipeline
     )
     model_uri_param = ParameterString(name="model_uri", default_value=model_uri)
 
@@ -525,14 +529,14 @@ def test_model_registration_with_drift_check_baselines(
         '"standard_deviation": 2.219186917819692}}}'
     )
     metrics_base_uri = "s3://{}/{}/input/metrics/{}".format(
-        sagemaker_session.default_bucket(),
+        sagemaker_session_for_pipeline.default_bucket(),
         "register_model_test_with_drift_baseline",
         utils.unique_name_from_base("metrics"),
     )
     metrics_uri = S3Uploader.upload_string_as_file_body(
         body=metrics_data,
         desired_s3_uri=metrics_base_uri,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
     metrics_uri_param = ParameterString(name="metrics_uri", default_value=metrics_uri)
 
@@ -610,7 +614,7 @@ def test_model_registration_with_drift_check_baselines(
         instance_type=instance_type,
         instance_count=instance_count,
         framework_version="0.90-2",
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
         py_version="py3",
         role=role,
     )
@@ -645,7 +649,7 @@ def test_model_registration_with_drift_check_baselines(
             instance_count,
         ],
         steps=[step_register],
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     try:
@@ -677,7 +681,7 @@ def test_model_registration_with_drift_check_baselines(
             assert execution_steps[0]["StepStatus"] == "Succeeded"
             assert execution_steps[0]["StepName"] == "MyRegisterModelStep-RegisterModel"
 
-            response = sagemaker_session.sagemaker_client.describe_model_package(
+            response = sagemaker_session_for_pipeline.sagemaker_client.describe_model_package(
                 ModelPackageName=execution_steps[0]["Metadata"]["RegisterModel"]["Arn"]
             )
 
@@ -714,16 +718,604 @@ def test_model_registration_with_drift_check_baselines(
             pass
 
 
+def test_model_registration_with_model_card_object(
+    sagemaker_session_for_pipeline,
+    role,
+    pipeline_name,
+):
+    instance_count = ParameterInteger(name="InstanceCount", default_value=1)
+    instance_type = "ml.m5.xlarge"
+
+    # upload model data to s3
+    model_local_path = os.path.join(DATA_DIR, "mxnet_mnist/model.tar.gz")
+    model_base_uri = "s3://{}/{}/input/model/{}".format(
+        sagemaker_session_for_pipeline.default_bucket(),
+        "register_model_test_with_drift_baseline",
+        utils.unique_name_from_base("model"),
+    )
+    model_uri = S3Uploader.upload(
+        model_local_path, model_base_uri, sagemaker_session=sagemaker_session_for_pipeline
+    )
+    model_uri_param = ParameterString(name="model_uri", default_value=model_uri)
+
+    # upload metrics to s3
+    metrics_data = (
+        '{"regression_metrics": {"mse": {"value": 4.925353410353891, '
+        '"standard_deviation": 2.219186917819692}}}'
+    )
+    metrics_base_uri = "s3://{}/{}/input/metrics/{}".format(
+        sagemaker_session_for_pipeline.default_bucket(),
+        "register_model_test_with_drift_baseline",
+        utils.unique_name_from_base("metrics"),
+    )
+    metrics_uri = S3Uploader.upload_string_as_file_body(
+        body=metrics_data,
+        desired_s3_uri=metrics_base_uri,
+        sagemaker_session=sagemaker_session_for_pipeline,
+    )
+    metrics_uri_param = ParameterString(name="metrics_uri", default_value=metrics_uri)
+
+    model_metrics = ModelMetrics(
+        bias=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        explainability=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        bias_pre_training=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        bias_post_training=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+    )
+    customer_metadata_properties = {"key1": "value1"}
+    domain = "COMPUTER_VISION"
+    task = "IMAGE_CLASSIFICATION"
+    sample_payload_url = "s3://test-bucket/model"
+    framework = "TENSORFLOW"
+    framework_version = "2.9"
+    nearest_model_name = "resnet50"
+    data_input_configuration = '{"input_1":[1,224,224,3]}'
+    skip_model_validation = "All"
+
+    # If image_uri is not provided, the instance_type should not be a pipeline variable
+    # since instance_type is used to retrieve image_uri in compile time (PySDK)
+    estimator = XGBoost(
+        entry_point="training.py",
+        source_dir=os.path.join(DATA_DIR, "sip"),
+        instance_type=instance_type,
+        instance_count=instance_count,
+        framework_version="0.90-2",
+        sagemaker_session=sagemaker_session_for_pipeline,
+        py_version="py3",
+        role=role,
+    )
+    intended_uses = IntendedUses(
+        purpose_of_model="Test model card.",
+        intended_uses="Not used except this test.",
+        factors_affecting_model_efficiency="No.",
+        risk_rating="Low",
+        explanations_for_risk_rating="Just an example.",
+    )
+    business_details = BusinessDetails(
+        business_problem="The business problem that your model is used to solve.",
+        business_stakeholders="The stakeholders who have the interest in the business that your model is used for.",
+        line_of_business="Services that the business is offering.",
+    )
+    additional_information = AdditionalInformation(
+        ethical_considerations="Your model ethical consideration.",
+        caveats_and_recommendations="Your model's caveats and recommendations.",
+        custom_details={"custom details1": "details value"},
+    )
+    manual_metric_group = MetricGroup(
+        name="binary classification metrics",
+        metric_data=[Metric(name="accuracy", type=MetricTypeEnum.NUMBER, value=0.5)],
+    )
+    example_evaluation_job = EvaluationJob(
+        name="Example evaluation job",
+        evaluation_observation="Evaluation observations.",
+        datasets=["s3://path/to/evaluation/data"],
+        metric_groups=[manual_metric_group],
+    )
+    evaluation_details = [example_evaluation_job]
+
+    model_overview = ModelOverview(model_creator="TestCreator")
+
+    my_card = ModelCard(
+        name="TestName",
+        sagemaker_session=sagemaker_session_for_pipeline,
+        status=ModelCardStatusEnum.DRAFT,
+        model_overview=model_overview,
+        intended_uses=intended_uses,
+        business_details=business_details,
+        evaluation_details=evaluation_details,
+        additional_information=additional_information,
+    )
+
+    step_register = RegisterModel(
+        name="MyRegisterModelStep",
+        estimator=estimator,
+        model_data=model_uri_param,
+        content_types=["application/json"],
+        response_types=["application/json"],
+        inference_instances=["ml.t2.medium", "ml.m5.xlarge"],
+        transform_instances=["ml.m5.xlarge"],
+        model_package_group_name="testModelPackageGroup",
+        model_metrics=model_metrics,
+        customer_metadata_properties=customer_metadata_properties,
+        domain=domain,
+        sample_payload_url=sample_payload_url,
+        task=task,
+        framework=framework,
+        framework_version=framework_version,
+        nearest_model_name=nearest_model_name,
+        data_input_configuration=data_input_configuration,
+        skip_model_validation=skip_model_validation,
+        model_card=my_card,
+    )
+
+    pipeline = Pipeline(
+        name=pipeline_name,
+        parameters=[
+            model_uri_param,
+            metrics_uri_param,
+            instance_count,
+        ],
+        steps=[step_register],
+        sagemaker_session=sagemaker_session_for_pipeline,
+    )
+
+    try:
+        response = pipeline.create(role)
+        create_arn = response["PipelineArn"]
+
+        for _ in retries(
+            max_retry_count=5,
+            exception_message_prefix="Waiting for a successful execution of pipeline",
+            seconds_to_sleep=10,
+        ):
+            execution = pipeline.start(
+                parameters={"model_uri": model_uri, "metrics_uri": metrics_uri}
+            )
+            response = execution.describe()
+
+            assert response["PipelineArn"] == create_arn
+
+            wait_pipeline_execution(execution=execution)
+            execution_steps = execution.list_steps()
+
+            assert len(execution_steps) == 1
+            failure_reason = execution_steps[0].get("FailureReason", "")
+            if failure_reason != "":
+                logging.error(
+                    f"Pipeline execution failed with error: {failure_reason}." " Retrying.."
+                )
+                continue
+            assert execution_steps[0]["StepStatus"] == "Succeeded"
+            assert execution_steps[0]["StepName"] == "MyRegisterModelStep-RegisterModel"
+
+            response = sagemaker_session_for_pipeline.sagemaker_client.describe_model_package(
+                ModelPackageName=execution_steps[0]["Metadata"]["RegisterModel"]["Arn"]
+            )
+
+            assert (
+                response["ModelMetrics"]["Explainability"]["Report"]["ContentType"]
+                == "application/json"
+            )
+            assert response["CustomerMetadataProperties"] == customer_metadata_properties
+            assert response["Domain"] == domain
+            assert response["Task"] == task
+            assert response["SamplePayloadUrl"] == sample_payload_url
+            assert response["SkipModelValidation"] == skip_model_validation
+            assert (response["ModelCard"]["ModelCardStatus"]) == ModelCardStatusEnum.DRAFT
+            model_card_content = json.loads(response["ModelCard"]["ModelCardContent"])
+            assert (model_card_content["model_overview"]["model_creator"]) == "TestCreator"
+            assert (model_card_content["intended_uses"]["purpose_of_model"]) == "Test model card."
+            assert (
+                model_card_content["business_details"]["line_of_business"]
+            ) == "Services that the business is offering."
+            assert (model_card_content["evaluation_details"][0]["name"]) == "Example evaluation job"
+
+            break
+    finally:
+        try:
+            pipeline.delete()
+        except Exception:
+            pass
+
+
+def test_model_registration_with_model_life_cycle_object(
+    sagemaker_session_for_pipeline,
+    role,
+    pipeline_name,
+):
+    instance_count = ParameterInteger(name="InstanceCount", default_value=1)
+    instance_type = "ml.m5.xlarge"
+
+    # upload model data to s3
+    model_local_path = os.path.join(DATA_DIR, "mxnet_mnist/model.tar.gz")
+    model_base_uri = "s3://{}/{}/input/model/{}".format(
+        sagemaker_session_for_pipeline.default_bucket(),
+        "register_model_test_with_drift_baseline",
+        utils.unique_name_from_base("model"),
+    )
+    model_uri = S3Uploader.upload(
+        model_local_path, model_base_uri, sagemaker_session=sagemaker_session_for_pipeline
+    )
+    model_uri_param = ParameterString(name="model_uri", default_value=model_uri)
+
+    # upload metrics to s3
+    metrics_data = (
+        '{"regression_metrics": {"mse": {"value": 4.925353410353891, '
+        '"standard_deviation": 2.219186917819692}}}'
+    )
+    metrics_base_uri = "s3://{}/{}/input/metrics/{}".format(
+        sagemaker_session_for_pipeline.default_bucket(),
+        "register_model_test_with_drift_baseline",
+        utils.unique_name_from_base("metrics"),
+    )
+    metrics_uri = S3Uploader.upload_string_as_file_body(
+        body=metrics_data,
+        desired_s3_uri=metrics_base_uri,
+        sagemaker_session=sagemaker_session_for_pipeline,
+    )
+    metrics_uri_param = ParameterString(name="metrics_uri", default_value=metrics_uri)
+
+    model_metrics = ModelMetrics(
+        bias=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        explainability=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        bias_pre_training=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        bias_post_training=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+    )
+    customer_metadata_properties = {"key1": "value1"}
+    domain = "COMPUTER_VISION"
+    task = "IMAGE_CLASSIFICATION"
+    sample_payload_url = "s3://test-bucket/model"
+    framework = "TENSORFLOW"
+    framework_version = "2.9"
+    nearest_model_name = "resnet50"
+    data_input_configuration = '{"input_1":[1,224,224,3]}'
+    skip_model_validation = "All"
+
+    # If image_uri is not provided, the instance_type should not be a pipeline variable
+    # since instance_type is used to retrieve image_uri in compile time (PySDK)
+    estimator = XGBoost(
+        entry_point="training.py",
+        source_dir=os.path.join(DATA_DIR, "sip"),
+        instance_type=instance_type,
+        instance_count=instance_count,
+        framework_version="0.90-2",
+        sagemaker_session=sagemaker_session_for_pipeline,
+        py_version="py3",
+        role=role,
+    )
+    create_model_life_cycle = {
+        "Stage": "Development",
+        "StageStatus": "In-Progress",
+        "StageDescription": "Development In Progress",
+    }
+
+    step_register = RegisterModel(
+        name="MyRegisterModelStep",
+        estimator=estimator,
+        model_data=model_uri_param,
+        content_types=["application/json"],
+        response_types=["application/json"],
+        inference_instances=["ml.t2.medium", "ml.m5.xlarge"],
+        transform_instances=["ml.m5.xlarge"],
+        model_package_group_name="testModelPackageGroup",
+        model_metrics=model_metrics,
+        customer_metadata_properties=customer_metadata_properties,
+        domain=domain,
+        sample_payload_url=sample_payload_url,
+        task=task,
+        framework=framework,
+        framework_version=framework_version,
+        nearest_model_name=nearest_model_name,
+        data_input_configuration=data_input_configuration,
+        skip_model_validation=skip_model_validation,
+        model_life_cycle=create_model_life_cycle,
+    )
+
+    pipeline = Pipeline(
+        name=pipeline_name,
+        parameters=[
+            model_uri_param,
+            metrics_uri_param,
+            instance_count,
+        ],
+        steps=[step_register],
+        sagemaker_session=sagemaker_session_for_pipeline,
+    )
+
+    try:
+        response = pipeline.create(role)
+        create_arn = response["PipelineArn"]
+
+        for _ in retries(
+            max_retry_count=5,
+            exception_message_prefix="Waiting for a successful execution of pipeline",
+            seconds_to_sleep=10,
+        ):
+            execution = pipeline.start(
+                parameters={"model_uri": model_uri, "metrics_uri": metrics_uri}
+            )
+            response = execution.describe()
+
+            assert response["PipelineArn"] == create_arn
+
+            wait_pipeline_execution(execution=execution)
+            execution_steps = execution.list_steps()
+
+            assert len(execution_steps) == 1
+            failure_reason = execution_steps[0].get("FailureReason", "")
+            if failure_reason != "":
+                logging.error(
+                    f"Pipeline execution failed with error: {failure_reason}." " Retrying.."
+                )
+                continue
+            assert execution_steps[0]["StepStatus"] == "Succeeded"
+            assert execution_steps[0]["StepName"] == "MyRegisterModelStep-RegisterModel"
+
+            response = sagemaker_session_for_pipeline.sagemaker_client.describe_model_package(
+                ModelPackageName=execution_steps[0]["Metadata"]["RegisterModel"]["Arn"]
+            )
+
+            assert (
+                response["ModelMetrics"]["Explainability"]["Report"]["ContentType"]
+                == "application/json"
+            )
+            assert response["CustomerMetadataProperties"] == customer_metadata_properties
+            assert response["Domain"] == domain
+            assert response["Task"] == task
+            assert response["SamplePayloadUrl"] == sample_payload_url
+            assert response["SkipModelValidation"] == skip_model_validation
+            assert (response["ModelLifeCycle"]["Stage"]) == "Development"
+            assert (response["ModelLifeCycle"]["StageStatus"]) == "In-Progress"
+            assert (response["ModelLifeCycle"]["StageDescription"]) == "Development In Progress"
+            break
+    finally:
+        try:
+            pipeline.delete()
+        except Exception:
+            pass
+
+
+def test_model_registration_with_model_card_json(
+    sagemaker_session_for_pipeline,
+    role,
+    pipeline_name,
+):
+    instance_count = ParameterInteger(name="InstanceCount", default_value=1)
+    instance_type = "ml.m5.xlarge"
+
+    # upload model data to s3
+    model_local_path = os.path.join(DATA_DIR, "mxnet_mnist/model.tar.gz")
+    model_base_uri = "s3://{}/{}/input/model/{}".format(
+        sagemaker_session_for_pipeline.default_bucket(),
+        "register_model_test_with_drift_baseline",
+        utils.unique_name_from_base("model"),
+    )
+    model_uri = S3Uploader.upload(
+        model_local_path, model_base_uri, sagemaker_session=sagemaker_session_for_pipeline
+    )
+    model_uri_param = ParameterString(name="model_uri", default_value=model_uri)
+
+    # upload metrics to s3
+    metrics_data = (
+        '{"regression_metrics": {"mse": {"value": 4.925353410353891, '
+        '"standard_deviation": 2.219186917819692}}}'
+    )
+    metrics_base_uri = "s3://{}/{}/input/metrics/{}".format(
+        sagemaker_session_for_pipeline.default_bucket(),
+        "register_model_test_with_drift_baseline",
+        utils.unique_name_from_base("metrics"),
+    )
+    metrics_uri = S3Uploader.upload_string_as_file_body(
+        body=metrics_data,
+        desired_s3_uri=metrics_base_uri,
+        sagemaker_session=sagemaker_session_for_pipeline,
+    )
+    metrics_uri_param = ParameterString(name="metrics_uri", default_value=metrics_uri)
+
+    model_metrics = ModelMetrics(
+        bias=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        explainability=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        bias_pre_training=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+        bias_post_training=MetricsSource(
+            s3_uri=metrics_uri_param,
+            content_type="application/json",
+        ),
+    )
+    customer_metadata_properties = {"key1": "value1"}
+    domain = "COMPUTER_VISION"
+    task = "IMAGE_CLASSIFICATION"
+    sample_payload_url = "s3://test-bucket/model"
+    framework = "TENSORFLOW"
+    framework_version = "2.9"
+    nearest_model_name = "resnet50"
+    data_input_configuration = '{"input_1":[1,224,224,3]}'
+    skip_model_validation = "All"
+
+    # If image_uri is not provided, the instance_type should not be a pipeline variable
+    # since instance_type is used to retrieve image_uri in compile time (PySDK)
+    estimator = XGBoost(
+        entry_point="training.py",
+        source_dir=os.path.join(DATA_DIR, "sip"),
+        instance_type=instance_type,
+        instance_count=instance_count,
+        framework_version="0.90-2",
+        sagemaker_session=sagemaker_session_for_pipeline,
+        py_version="py3",
+        role=role,
+    )
+
+    model_card_content = {
+        "model_overview": {
+            "model_creator": "TestCreator",
+        },
+        "intended_uses": {
+            "purpose_of_model": "Test model card.",
+            "intended_uses": "Not used except this test.",
+            "factors_affecting_model_efficiency": "No.",
+            "risk_rating": "Low",
+            "explanations_for_risk_rating": "Just an example.",
+        },
+        "business_details": {
+            "business_problem": "The business problem that your model is used to solve.",
+            "business_stakeholders": "The stakeholders who have the interest in the business.",
+            "line_of_business": "Services that the business is offering.",
+        },
+        "evaluation_details": [
+            {
+                "name": "Example evaluation job",
+                "evaluation_observation": "Evaluation observations.",
+                "metric_groups": [
+                    {
+                        "name": "binary classification metrics",
+                        "metric_data": [{"name": "accuracy", "type": "number", "value": 0.5}],
+                    }
+                ],
+            }
+        ],
+        "additional_information": {
+            "ethical_considerations": "Your model ethical consideration.",
+            "caveats_and_recommendations": 'Your model"s caveats and recommendations.',
+            "custom_details": {"custom details1": "details value"},
+        },
+    }
+    my_card = ModelPackageModelCard(
+        model_card_status=ModelCardStatusEnum.DRAFT, model_card_content=model_card_content
+    )
+
+    step_register = RegisterModel(
+        name="MyRegisterModelStep",
+        estimator=estimator,
+        model_data=model_uri_param,
+        content_types=["application/json"],
+        response_types=["application/json"],
+        inference_instances=["ml.t2.medium", "ml.m5.xlarge"],
+        transform_instances=["ml.m5.xlarge"],
+        model_package_group_name="testModelPackageGroup",
+        model_metrics=model_metrics,
+        customer_metadata_properties=customer_metadata_properties,
+        domain=domain,
+        sample_payload_url=sample_payload_url,
+        task=task,
+        framework=framework,
+        framework_version=framework_version,
+        nearest_model_name=nearest_model_name,
+        data_input_configuration=data_input_configuration,
+        skip_model_validation=skip_model_validation,
+        model_card=my_card,
+    )
+
+    pipeline = Pipeline(
+        name=pipeline_name,
+        parameters=[
+            model_uri_param,
+            metrics_uri_param,
+            instance_count,
+        ],
+        steps=[step_register],
+        sagemaker_session=sagemaker_session_for_pipeline,
+    )
+
+    try:
+        response = pipeline.create(role)
+        create_arn = response["PipelineArn"]
+
+        for _ in retries(
+            max_retry_count=5,
+            exception_message_prefix="Waiting for a successful execution of pipeline",
+            seconds_to_sleep=10,
+        ):
+            execution = pipeline.start(
+                parameters={"model_uri": model_uri, "metrics_uri": metrics_uri}
+            )
+            response = execution.describe()
+
+            assert response["PipelineArn"] == create_arn
+
+            wait_pipeline_execution(execution=execution)
+            execution_steps = execution.list_steps()
+
+            assert len(execution_steps) == 1
+            failure_reason = execution_steps[0].get("FailureReason", "")
+            if failure_reason != "":
+                logging.error(
+                    f"Pipeline execution failed with error: {failure_reason}." " Retrying.."
+                )
+                continue
+            assert execution_steps[0]["StepStatus"] == "Succeeded"
+            assert execution_steps[0]["StepName"] == "MyRegisterModelStep-RegisterModel"
+
+            response = sagemaker_session_for_pipeline.sagemaker_client.describe_model_package(
+                ModelPackageName=execution_steps[0]["Metadata"]["RegisterModel"]["Arn"]
+            )
+
+            assert (
+                response["ModelMetrics"]["Explainability"]["Report"]["ContentType"]
+                == "application/json"
+            )
+            assert response["CustomerMetadataProperties"] == customer_metadata_properties
+            assert response["Domain"] == domain
+            assert response["Task"] == task
+            assert response["SamplePayloadUrl"] == sample_payload_url
+            assert response["SkipModelValidation"] == skip_model_validation
+            assert (response["ModelCard"]["ModelCardStatus"]) == ModelCardStatusEnum.DRAFT
+            model_card_content = json.loads(response["ModelCard"]["ModelCardContent"])
+            assert (model_card_content["model_overview"]["model_creator"]) == "TestCreator"
+            assert (model_card_content["intended_uses"]["purpose_of_model"]) == "Test model card."
+            assert (
+                model_card_content["business_details"]["line_of_business"]
+            ) == "Services that the business is offering."
+            assert (model_card_content["evaluation_details"][0]["name"]) == "Example evaluation job"
+
+            break
+    finally:
+        try:
+            pipeline.delete()
+        except Exception:
+            pass
+
+
 def test_model_registration_with_model_repack(
-    sagemaker_session,
+    sagemaker_session_for_pipeline,
     role,
     pipeline_name,
     region_name,
 ):
-    kms_key = get_or_create_kms_key(sagemaker_session, role)
+    kms_key = get_or_create_kms_key(sagemaker_session_for_pipeline, role)
     base_dir = os.path.join(DATA_DIR, "pytorch_mnist")
     entry_point = os.path.join(base_dir, "mnist.py")
-    input_path = sagemaker_session.upload_data(
+    input_path = sagemaker_session_for_pipeline.upload_data(
         path=os.path.join(base_dir, "training"),
         key_prefix="integ-test-data/pytorch_mnist/training",
     )
@@ -742,7 +1334,7 @@ def test_model_registration_with_model_repack(
         py_version="py3",
         instance_count=instance_count,
         instance_type=instance_type,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
         output_kms_key=kms_key,
     )
     step_train = TrainingStep(
@@ -767,7 +1359,7 @@ def test_model_registration_with_model_repack(
     model = Model(
         image_uri=pytorch_estimator.training_image_uri(),
         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
         role=role,
     )
     model_inputs = CreateModelInput(
@@ -791,7 +1383,7 @@ def test_model_registration_with_model_repack(
         name=pipeline_name,
         parameters=[good_enough_input, instance_count],
         steps=[step_cond],
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     try:
@@ -823,11 +1415,21 @@ def test_model_registration_with_model_repack(
 
 
 def test_model_registration_with_tensorflow_model_with_pipeline_model(
-    sagemaker_session, role, tf_full_version, tf_full_py_version, pipeline_name, region_name
+    sagemaker_session_for_pipeline,
+    role,
+    tf_full_version,
+    tf_full_py_version,
+    pipeline_name,
+    region_name,
 ):
+    if Version(tf_full_version) in SpecifierSet("==2.16.*"):
+        pytest.skip(
+            "This test is failing in TensorFlow 2.16 beacuse of an upstream bug: "
+            "https://github.com/tensorflow/io/issues/2039"
+        )
     base_dir = os.path.join(DATA_DIR, "tensorflow_mnist")
     entry_point = os.path.join(base_dir, "mnist_v2.py")
-    input_path = sagemaker_session.upload_data(
+    input_path = sagemaker_session_for_pipeline.upload_data(
         path=os.path.join(base_dir, "data"),
         key_prefix="integ-test-data/tf-scriptmode/mnist/training",
     )
@@ -845,7 +1447,7 @@ def test_model_registration_with_tensorflow_model_with_pipeline_model(
         instance_type=instance_type,
         framework_version=tf_full_version,
         py_version=tf_full_py_version,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
     step_train = TrainingStep(
         name="MyTrain",
@@ -858,11 +1460,14 @@ def test_model_registration_with_tensorflow_model_with_pipeline_model(
         framework_version="2.4",
         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
         role=role,
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     pipeline_model = PipelineModel(
-        name="MyModelPipeline", models=[model], role=role, sagemaker_session=sagemaker_session
+        name="MyModelPipeline",
+        models=[model],
+        role=role,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     step_register_model = RegisterModel(
@@ -880,7 +1485,7 @@ def test_model_registration_with_tensorflow_model_with_pipeline_model(
         name=pipeline_name,
         parameters=[instance_count],
         steps=[step_train, step_register_model],
-        sagemaker_session=sagemaker_session,
+        sagemaker_session=sagemaker_session_for_pipeline,
     )
 
     try:

@@ -19,7 +19,9 @@ from mock import Mock, patch
 
 import sagemaker
 from sagemaker.model import ModelPackage
-from sagemaker.model_card.schema_constraints import ModelApprovalStatusEnum
+from sagemaker.model_card.model_card import ModelCard, ModelOverview
+from sagemaker.model_card.schema_constraints import ModelApprovalStatusEnum, ModelCardStatusEnum
+from sagemaker.model_life_cycle import ModelLifeCycle
 
 MODEL_PACKAGE_VERSIONED_ARN = (
     "arn:aws:sagemaker:us-west-2:001234567890:model-package/testmodelgroup/1"
@@ -56,6 +58,10 @@ DESCRIBE_MODEL_PACKAGE_RESPONSE = {
     "ModelPackageStatus": "Completed",
     "ModelPackageName": "mp-scikit-decision-trees-1542410022-2018-11-20-22-13-56-502",
     "CertifyForMarketplace": False,
+    "ModelCard": {
+        "ModelCardStatus": "Draft",
+        "ModelCardContent": '{"model_overview": {"model_creator": "updatedCreator", "model_artifact": []}}',
+    },
 }
 
 MODEL_DATA = {
@@ -223,22 +229,21 @@ def test_create_sagemaker_model_include_tags(sagemaker_session):
     )
 
 
-def test_model_package_model_data_source_not_supported(sagemaker_session):
-    with pytest.raises(
-        ValueError, match="Creating ModelPackage with ModelDataSource is currently not supported"
-    ):
-        ModelPackage(
-            role="role",
-            model_package_arn="my-model-package",
-            model_data={
-                "S3DataSource": {
-                    "S3Uri": "s3://bucket/model/prefix/",
-                    "S3DataType": "S3Prefix",
-                    "CompressionType": "None",
-                }
-            },
-            sagemaker_session=sagemaker_session,
-        )
+def test_model_package_model_data_source_supported(sagemaker_session):
+    model_data_source = {
+        "S3DataSource": {
+            "S3Uri": "s3://bucket/model/prefix/",
+            "S3DataType": "S3Prefix",
+            "CompressionType": "None",
+        }
+    }
+    model_package = ModelPackage(
+        role="role",
+        model_package_arn="my-model-package",
+        model_data=model_data_source,
+        sagemaker_session=sagemaker_session,
+    )
+    assert model_package.model_data == model_package.model_data
 
 
 @patch("sagemaker.utils.name_from_base")
@@ -398,4 +403,130 @@ def test_add_inference_specification(sagemaker_session):
                 "Name": "Inference",
             }
         ],
+    )
+
+
+def test_update_inference_specification(sagemaker_session):
+    model_package = ModelPackage(
+        role="role",
+        model_package_arn=MODEL_PACKAGE_VERSIONED_ARN,
+        sagemaker_session=sagemaker_session,
+    )
+
+    image_uris = ["image_uri"]
+
+    containers = [{"Image": "image_uri"}]
+
+    try:
+        model_package.update_inference_specification(image_uris=image_uris, containers=containers)
+    except ValueError as ve:
+        assert "Should have either containers or image_uris for inference." in str(ve)
+
+    try:
+        model_package.update_inference_specification()
+    except ValueError as ve:
+        assert "Should have either containers or image_uris for inference." in str(ve)
+
+    model_package.update_inference_specification(image_uris=image_uris)
+
+    sagemaker_session.sagemaker_client.update_model_package.assert_called_with(
+        ModelPackageArn=MODEL_PACKAGE_VERSIONED_ARN,
+        InferenceSpecification={
+            "Containers": [{"Image": "image_uri"}],
+        },
+    )
+
+
+def test_update_source_uri(sagemaker_session):
+    source_uri = "dummy_source_uri"
+    model_package = ModelPackage(
+        role="role",
+        model_package_arn=MODEL_PACKAGE_VERSIONED_ARN,
+        sagemaker_session=sagemaker_session,
+    )
+    model_package.update_source_uri(source_uri=source_uri)
+    sagemaker_session.sagemaker_client.update_model_package.assert_called_with(
+        ModelPackageArn=MODEL_PACKAGE_VERSIONED_ARN, SourceUri=source_uri
+    )
+
+
+def test_update_model_card(sagemaker_session):
+    model_package_response = copy.deepcopy(DESCRIBE_MODEL_PACKAGE_RESPONSE)
+
+    sagemaker_session.sagemaker_client.describe_model_package = Mock(
+        return_value=model_package_response
+    )
+    model_package = ModelPackage(
+        role="role",
+        model_package_arn=MODEL_PACKAGE_VERSIONED_ARN,
+        sagemaker_session=sagemaker_session,
+    )
+
+    update_my_card = ModelCard(
+        name="UpdateTestName",
+        sagemaker_session=sagemaker_session,
+        status=ModelCardStatusEnum.PENDING_REVIEW,
+    )
+    model_package.update_model_card(update_my_card)
+    update_my_card_req = update_my_card._create_request_args()
+    del update_my_card_req["ModelCardName"]
+    del update_my_card_req["Content"]
+    sagemaker_session.sagemaker_client.update_model_package.assert_called_with(
+        ModelPackageArn=MODEL_PACKAGE_VERSIONED_ARN, ModelCard=update_my_card_req
+    )
+
+    model_overview = ModelOverview(
+        model_creator="UpdatedNewCreator",
+    )
+    update_my_card_1 = ModelCard(
+        name="UpdateTestName",
+        sagemaker_session=sagemaker_session,
+        status=ModelCardStatusEnum.DRAFT,
+        model_overview=model_overview,
+    )
+    model_package.update_model_card(update_my_card_1)
+    update_my_card_req_1 = update_my_card_1._create_request_args()
+    del update_my_card_req_1["ModelCardName"]
+    del update_my_card_req_1["ModelCardStatus"]
+    update_my_card_req_1["ModelCardContent"] = update_my_card_req_1["Content"]
+    del update_my_card_req_1["Content"]
+    sagemaker_session.sagemaker_client.update_model_package.assert_called_with(
+        ModelPackageArn=MODEL_PACKAGE_VERSIONED_ARN, ModelCard=update_my_card_req_1
+    )
+
+
+def test_update_model_life_cycle(sagemaker_session):
+    model_package_response = copy.deepcopy(DESCRIBE_MODEL_PACKAGE_RESPONSE)
+
+    sagemaker_session.sagemaker_client.describe_model_package = Mock(
+        return_value=model_package_response
+    )
+    model_package = ModelPackage(
+        role="role",
+        model_package_arn=MODEL_PACKAGE_VERSIONED_ARN,
+        sagemaker_session=sagemaker_session,
+    )
+
+    update_model_life_cycle = ModelLifeCycle(
+        stage="Development",
+        stage_status="Approved",
+        stage_description="Approving for Development",
+    )
+    update_model_life_cycle_req = update_model_life_cycle._to_request_dict()
+    model_package.update_model_life_cycle(update_model_life_cycle_req)
+
+    sagemaker_session.sagemaker_client.update_model_package.assert_called_with(
+        ModelPackageArn=MODEL_PACKAGE_VERSIONED_ARN, ModelLifeCycle=update_model_life_cycle_req
+    )
+
+    update_model_life_cycle1 = ModelLifeCycle(
+        stage="Staging",
+        stage_status="In-Progress",
+        stage_description="Sending for Staging Verification",
+    )
+    update_model_life_cycle_req1 = update_model_life_cycle1._to_request_dict()
+    model_package.update_model_life_cycle(update_model_life_cycle_req1)
+
+    sagemaker_session.sagemaker_client.update_model_package.assert_called_with(
+        ModelPackageArn=MODEL_PACKAGE_VERSIONED_ARN, ModelLifeCycle=update_model_life_cycle_req1
     )

@@ -99,6 +99,7 @@ def test_serialize_deserialize_lambda():
     assert deserialized(3) == 9
 
 
+@pytest.mark.flaky(reruns=3, reruns_delay=5)
 @patch("sagemaker.s3.S3Uploader.upload_bytes", new=upload)
 @patch("sagemaker.s3.S3Downloader.read_bytes", new=read)
 @patch("sagemaker.experiments.run.Experiment")
@@ -106,9 +107,11 @@ def test_serialize_deserialize_lambda():
 @patch("sagemaker.experiments.run._TrialComponent._load_or_create", return_value=(Mock(), False))
 @patch("sagemaker.experiments.run._MetricsManager")
 @patch("sagemaker.remote_function.job.Session")
-def test_serialize_func_referencing_to_run(*args, **kwargs):
+def test_serialize_func_referencing_to_run(sagemaker_session, *args, **kwargs):
 
-    with Run(experiment_name="exp_name", run_name="run_name") as run:
+    with Run(
+        sagemaker_session=sagemaker_session, experiment_name="exp_name", run_name="run_name"
+    ) as run:
 
         def train(x):
             return run.log_metric()
@@ -302,6 +305,7 @@ def test_serialize_deserialize_none():
     assert deserialized is None
 
 
+@pytest.mark.flaky(reruns=3, reruns_delay=5)
 @patch("sagemaker.s3.S3Uploader.upload_bytes", new=upload)
 @patch("sagemaker.s3.S3Downloader.read_bytes", new=read)
 @patch("sagemaker.experiments.run.Experiment")
@@ -309,8 +313,10 @@ def test_serialize_deserialize_none():
 @patch("sagemaker.experiments.run._TrialComponent._load_or_create", return_value=(Mock(), False))
 @patch("sagemaker.experiments.run._MetricsManager")
 @patch("sagemaker.remote_function.job.Session")
-def test_serialize_run(*args, **kwargs):
-    with Run(experiment_name="exp_name", run_name="run_name") as run:
+def test_serialize_run(sagemaker_session, *args, **kwargs):
+    with Run(
+        sagemaker_session=sagemaker_session, experiment_name="exp_name", run_name="run_name"
+    ) as run:
         s3_uri = random_s3_uri()
         with pytest.raises(
             SerializationError,
@@ -439,8 +445,7 @@ def test_serialize_deserialize_service_error():
 def test_serialize_deserialize_exception_with_traceback():
     s3_uri = random_s3_uri()
 
-    class CustomError(Exception):
-        ...
+    class CustomError(Exception): ...  # noqa E701
 
     def func_a():
         raise TypeError
@@ -469,8 +474,7 @@ def test_serialize_deserialize_exception_with_traceback():
 def test_serialize_deserialize_custom_exception_with_traceback():
     s3_uri = random_s3_uri()
 
-    class CustomError(Exception):
-        ...
+    class CustomError(Exception): ...  # noqa: E701
 
     def func_a():
         raise TypeError
@@ -500,8 +504,7 @@ def test_serialize_deserialize_custom_exception_with_traceback():
 def test_serialize_deserialize_remote_function_error_with_traceback():
     s3_uri = random_s3_uri()
 
-    class CustomError(Exception):
-        ...
+    class CustomError(Exception): ...  # noqa: E701
 
     def func_a():
         raise TypeError

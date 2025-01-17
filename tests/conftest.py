@@ -22,6 +22,7 @@ import tests.integ
 
 from botocore.config import Config
 from packaging.version import Version
+from packaging.specifiers import SpecifierSet
 
 from sagemaker import Session, image_uris, utils, get_execution_role
 from sagemaker.local import LocalSession
@@ -253,7 +254,9 @@ def mxnet_eia_latest_py_version():
 
 @pytest.fixture(scope="module", params=["py2", "py3"])
 def pytorch_training_py_version(pytorch_training_version, request):
-    if Version(pytorch_training_version) >= Version("2.0"):
+    if Version(pytorch_training_version) >= Version("2.3"):
+        return "py311"
+    elif Version(pytorch_training_version) >= Version("2.0"):
         return "py310"
     elif Version(pytorch_training_version) >= Version("1.13"):
         return "py39"
@@ -267,7 +270,9 @@ def pytorch_training_py_version(pytorch_training_version, request):
 
 @pytest.fixture(scope="module", params=["py2", "py3"])
 def pytorch_inference_py_version(pytorch_inference_version, request):
-    if Version(pytorch_inference_version) >= Version("2.0"):
+    if Version(pytorch_inference_version) >= Version("2.3"):
+        return "py311"
+    elif Version(pytorch_inference_version) >= Version("2.0"):
         return "py310"
     elif Version(pytorch_inference_version) >= Version("1.13"):
         return "py39"
@@ -551,11 +556,18 @@ def tf_full_version(tensorflow_training_latest_version, tensorflow_inference_lat
     Fixture exists as such, since TF training and TFS have different latest versions.
     Otherwise, this would simply be a single latest version.
     """
-    return str(
-        min(
-            Version(tensorflow_training_latest_version),
-            Version(tensorflow_inference_latest_version),
-        )
+    tensorflow_training_latest_version = Version(tensorflow_training_latest_version)
+    tensorflow_inference_latest_version = Version(tensorflow_inference_latest_version)
+
+    return_version = min(
+        tensorflow_training_latest_version,
+        tensorflow_inference_latest_version,
+    )
+
+    return (
+        f"{return_version.major}.{return_version.minor}"
+        if return_version in SpecifierSet(">=2.16")
+        else str(return_version)
     )
 
 

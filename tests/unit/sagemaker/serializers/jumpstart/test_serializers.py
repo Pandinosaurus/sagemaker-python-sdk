@@ -19,23 +19,28 @@ from mock.mock import patch
 
 from sagemaker import base_serializers, serializers
 from sagemaker.jumpstart.utils import verify_model_region_and_return_specs
+from sagemaker.jumpstart.enums import JumpStartModelType
 
 from tests.unit.sagemaker.jumpstart.utils import get_special_model_spec
 
 
+@patch("sagemaker.jumpstart.utils.validate_model_id_and_get_type")
 @patch("sagemaker.jumpstart.artifacts.predictors.verify_model_region_and_return_specs")
 @patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
 def test_jumpstart_default_serializers(
-    patched_get_model_specs, patched_verify_model_region_and_return_specs
+    patched_get_model_specs,
+    patched_verify_model_region_and_return_specs,
+    patched_validate_model_id_and_get_type,
 ):
 
     patched_verify_model_region_and_return_specs.side_effect = verify_model_region_and_return_specs
     patched_get_model_specs.side_effect = get_special_model_spec
+    patched_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
     model_id, model_version = "predictor-specs-model", "*"
     region = "us-west-2"
     mock_client = boto3.client("s3")
-    mock_session = Mock(s3_client=mock_client)
+    mock_session = Mock(s3_client=mock_client, boto_region_name=region)
 
     default_serializer = serializers.retrieve_default(
         region=region,
@@ -48,24 +53,32 @@ def test_jumpstart_default_serializers(
     patched_get_model_specs.assert_called_once_with(
         region=region,
         model_id=model_id,
+        hub_arn=None,
         version=model_version,
         s3_client=mock_client,
+        model_type=JumpStartModelType.OPEN_WEIGHTS,
+        sagemaker_session=mock_session,
     )
 
     patched_get_model_specs.reset_mock()
 
 
+@patch("sagemaker.jumpstart.utils.validate_model_id_and_get_type")
 @patch("sagemaker.jumpstart.artifacts.predictors.verify_model_region_and_return_specs")
 @patch("sagemaker.jumpstart.accessors.JumpStartModelsAccessor.get_model_specs")
 def test_jumpstart_serializer_options(
-    patched_get_model_specs, patched_verify_model_region_and_return_specs
+    patched_get_model_specs,
+    patched_verify_model_region_and_return_specs,
+    patched_validate_model_id_and_get_type,
 ):
 
     patched_verify_model_region_and_return_specs.side_effect = verify_model_region_and_return_specs
     patched_get_model_specs.side_effect = get_special_model_spec
+    patched_validate_model_id_and_get_type.return_value = JumpStartModelType.OPEN_WEIGHTS
 
     mock_client = boto3.client("s3")
-    mock_session = Mock(s3_client=mock_client)
+    region = "us-west-2"
+    mock_session = Mock(s3_client=mock_client, boto_region_name=region)
 
     model_id, model_version = "predictor-specs-model", "*"
     region = "us-west-2"
@@ -88,5 +101,8 @@ def test_jumpstart_serializer_options(
         region=region,
         model_id=model_id,
         version=model_version,
+        hub_arn=None,
         s3_client=mock_client,
+        model_type=JumpStartModelType.OPEN_WEIGHTS,
+        sagemaker_session=mock_session,
     )

@@ -72,11 +72,12 @@ def model_input():
 
 
 @pytest.fixture
-def model_builder_model_schema_builder():
+def model_builder_model_schema_builder(sagemaker_session):
     return ModelBuilder(
         model_path=HF_DIR,
         model="bert-base-uncased",
         schema_builder=SchemaBuilder(sample_input, loaded_response),
+        sagemaker_session=sagemaker_session,
     )
 
 
@@ -127,4 +128,4 @@ def test_pytorch_transformers_sagemaker_endpoint(
                 logger.exception(caught_ex)
                 assert (
                     False
-                ), f"{caught_ex} was thrown when running pytorch transformers sagemaker endpoint test"
+                ), f"{caught_ex} thrown when running pytorch transformers sagemaker endpoint test"

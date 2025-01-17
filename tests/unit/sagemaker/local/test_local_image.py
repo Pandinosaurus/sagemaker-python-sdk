@@ -160,7 +160,7 @@ def test_get_compose_cmd_prefix_with_docker_cli():
     "subprocess.check_output",
     side_effect=subprocess.CalledProcessError(returncode=1, cmd="docker compose version"),
 )
-@patch("sagemaker.local.image.find_executable", Mock(return_value="/usr/bin/docker-compose"))
+@patch("sagemaker.local.image.shutil.which", Mock(return_value="/usr/bin/docker-compose"))
 def test_get_compose_cmd_prefix_with_docker_compose_cli(check_output):
     compose_cmd_prefix = _SageMakerContainer._get_compose_cmd_prefix()
     assert compose_cmd_prefix == ["docker-compose"]
@@ -170,7 +170,7 @@ def test_get_compose_cmd_prefix_with_docker_compose_cli(check_output):
     "subprocess.check_output",
     side_effect=subprocess.CalledProcessError(returncode=1, cmd="docker compose version"),
 )
-@patch("sagemaker.local.image.find_executable", Mock(return_value=None))
+@patch("sagemaker.local.image.shutil.which", Mock(return_value=None))
 def test_get_compose_cmd_prefix_raises_import_error(check_output):
     with pytest.raises(ImportError) as e:
         _SageMakerContainer._get_compose_cmd_prefix()
@@ -221,9 +221,12 @@ def test_write_config_file(LocalSession, tmpdir):
     assert os.path.exists(resource_config_file)
     assert os.path.exists(input_data_config_file)
 
-    hyperparameters_data = json.load(open(hyperparameters_file))
-    resource_config_data = json.load(open(resource_config_file))
-    input_data_config_data = json.load(open(input_data_config_file))
+    with open(hyperparameters_file) as f:
+        hyperparameters_data = json.load(f)
+    with open(resource_config_file) as f:
+        resource_config_data = json.load(f)
+    with open(input_data_config_file) as f:
+        input_data_config_data = json.load(f)
 
     # Validate HyperParameters
     for k, v in HYPERPARAMETERS.items():
@@ -280,7 +283,8 @@ def test_write_config_files_input_content_type(LocalSession, tmpdir):
     sagemaker_container.write_config_files(host, HYPERPARAMETERS, input_data_config)
 
     assert os.path.exists(input_data_config_file)
-    parsed_input_config = json.load(open(input_data_config_file))
+    with open(input_data_config_file) as f:
+        parsed_input_config = json.load(f)
     # Validate Input Data Config
     for channel in input_data_config:
         assert channel["ChannelName"] in parsed_input_config

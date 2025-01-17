@@ -30,7 +30,6 @@ import sys
 import tarfile
 import tempfile
 
-from distutils.spawn import find_executable
 from threading import Thread
 from typing import Dict, List
 from six.moves.urllib.parse import urlparse
@@ -170,7 +169,7 @@ class _SageMakerContainer(object):
             compose_cmd_prefix.extend(["docker", "compose"])
             return compose_cmd_prefix
 
-        if find_executable("docker-compose") is not None:
+        if shutil.which("docker-compose") is not None:
             logger.info("'Docker Compose' found using Docker Compose CLI.")
             compose_cmd_prefix.extend(["docker-compose"])
             return compose_cmd_prefix
@@ -294,9 +293,9 @@ class _SageMakerContainer(object):
         }
         training_env_vars.update(environment)
         if self.sagemaker_session.s3_resource is not None:
-            training_env_vars[
-                S3_ENDPOINT_URL_ENV_NAME
-            ] = self.sagemaker_session.s3_resource.meta.client._endpoint.host
+            training_env_vars[S3_ENDPOINT_URL_ENV_NAME] = (
+                self.sagemaker_session.s3_resource.meta.client._endpoint.host
+            )
 
         compose_data = self._generate_compose_file(
             "train", additional_volumes=volumes, additional_env_vars=training_env_vars

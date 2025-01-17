@@ -1,4 +1,5 @@
 """Placeholder docstring"""
+
 from __future__ import absolute_import
 import io
 import logging
@@ -164,6 +165,11 @@ class SchemaBuilder(TritonSchemaBuilder):
             return StringSerializer()
         if _is_jsonable(obj):
             return JSONSerializerWrapper()
+        if isinstance(obj, dict) and "content_type" in obj:
+            try:
+                return DataSerializer(content_type=obj["content_type"])
+            except ValueError as e:
+                logger.error(e)
 
         raise ValueError(
             (
@@ -208,29 +214,43 @@ class SchemaBuilder(TritonSchemaBuilder):
 
     def __repr__(self):
         """Placeholder docstring"""
+        if hasattr(self, "input_serializer") and hasattr(self, "output_serializer"):
+            return (
+                f"SchemaBuilder(\n"
+                f"input_serializer={self.input_serializer}\n"
+                f"output_serializer={self.output_serializer}\n"
+                f"input_deserializer={self.input_deserializer._deserializer}\n"
+                f"output_deserializer={self.output_deserializer._deserializer})"
+            )
         return (
             f"SchemaBuilder(\n"
-            f"input_serializer={self.input_serializer}\n"
-            f"output_serializer={self.output_serializer}\n"
-            f"input_deserializer={self.input_deserializer._deserializer}\n"
-            f"output_deserializer={self.output_deserializer._deserializer})"
+            f"custom_input_translator={self.custom_input_translator}\n"
+            f"custom_output_translator={self.custom_output_translator}\n"
         )
 
     def generate_marshalling_map(self) -> dict:
         """Generate marshalling map for the schema builder"""
         return {
-            "input_serializer": self.input_serializer.__class__.__name__
-            if hasattr(self, "input_serializer")
-            else None,
-            "output_serializer": self.output_serializer.__class__.__name__
-            if hasattr(self, "output_serializer")
-            else None,
-            "input_deserializer": self._input_deserializer.__class__.__name__
-            if hasattr(self, "_input_deserializer")
-            else None,
-            "output_deserializer": self._output_deserializer.__class__.__name__
-            if hasattr(self, "_output_deserializer")
-            else None,
+            "input_serializer": (
+                self.input_serializer.__class__.__name__
+                if hasattr(self, "input_serializer")
+                else None
+            ),
+            "output_serializer": (
+                self.output_serializer.__class__.__name__
+                if hasattr(self, "output_serializer")
+                else None
+            ),
+            "input_deserializer": (
+                self._input_deserializer.__class__.__name__
+                if hasattr(self, "_input_deserializer")
+                else None
+            ),
+            "output_deserializer": (
+                self._output_deserializer.__class__.__name__
+                if hasattr(self, "_output_deserializer")
+                else None
+            ),
             "custom_input_translator": hasattr(self, "custom_input_translator"),
             "custom_output_translator": hasattr(self, "custom_output_translator"),
         }

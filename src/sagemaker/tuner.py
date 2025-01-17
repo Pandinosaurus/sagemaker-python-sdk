@@ -11,6 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """Placeholder docstring"""
+
 from __future__ import absolute_import
 
 import importlib
@@ -567,9 +568,9 @@ class TuningJobCompletionCriteriaConfig(object):
             ] = self.max_number_of_training_jobs_not_improving
 
         if self.target_objective_metric_value is not None:
-            completion_criteria_config[
-                TARGET_OBJECTIVE_METRIC_VALUE
-            ] = self.target_objective_metric_value
+            completion_criteria_config[TARGET_OBJECTIVE_METRIC_VALUE] = (
+                self.target_objective_metric_value
+            )
 
         if self.complete_on_convergence is not None:
             completion_criteria_config[CONVERGENCE_DETECTED] = {}
@@ -641,8 +642,11 @@ class HyperparameterTuner(object):
                 extract the metric from the logs. This should be defined only
                 for hyperparameter tuning jobs that don't use an Amazon
                 algorithm.
-            strategy (str or PipelineVariable): Strategy to be used for hyperparameter estimations
-                (default: 'Bayesian').
+            strategy (str or PipelineVariable): Strategy to be used for hyperparameter estimations.
+                More information about different strategies:
+                https://docs.aws.amazon.com/sagemaker/latest/dg/automatic-model-tuning-how-it-works.html.
+                Available options are: 'Bayesian', 'Random', 'Hyperband',
+                'Grid' (default: 'Bayesian')
             objective_type (str or PipelineVariable): The type of the objective metric for
                 evaluating training jobs. This value can be either 'Minimize' or
                 'Maximize' (default: 'Maximize').
@@ -759,7 +763,8 @@ class HyperparameterTuner(object):
         self.autotune = autotune
 
     def override_resource_config(
-        self, instance_configs: Union[List[InstanceConfig], Dict[str, List[InstanceConfig]]]
+        self,
+        instance_configs: Union[List[InstanceConfig], Dict[str, List[InstanceConfig]]],
     ):
         """Override the instance configuration of the estimators used by the tuner.
 
@@ -862,9 +867,11 @@ class HyperparameterTuner(object):
                 estimator_name: self._prepare_static_hyperparameters(
                     estimator,
                     self._hyperparameter_ranges_dict[estimator_name],
-                    include_cls_metadata.get(estimator_name, False)
-                    if isinstance(include_cls_metadata, dict)
-                    else include_cls_metadata,
+                    (
+                        include_cls_metadata.get(estimator_name, False)
+                        if isinstance(include_cls_metadata, dict)
+                        else include_cls_metadata
+                    ),
                 )
                 for (estimator_name, estimator) in self.estimator_dict.items()
             }
@@ -882,9 +889,11 @@ class HyperparameterTuner(object):
             static_auto_parameters_dict = {
                 estimator_name: self._prepare_auto_parameters(
                     self.static_hyperparameters_dict[estimator_name],
-                    self.hyperparameters_to_keep_static_dict.get(estimator_name, None)
-                    if self.hyperparameters_to_keep_static_dict
-                    else None,
+                    (
+                        self.hyperparameters_to_keep_static_dict.get(estimator_name, None)
+                        if self.hyperparameters_to_keep_static_dict
+                        else None
+                    ),
                 )
                 for estimator_name in sorted(self.estimator_dict.keys())
             }
@@ -966,7 +975,7 @@ class HyperparameterTuner(object):
         include_cls_metadata: Union[bool, Dict[str, bool]] = False,
         estimator_kwargs: Optional[Dict[str, dict]] = None,
         wait: bool = True,
-        **kwargs
+        **kwargs,
     ):
         """Start a hyperparameter tuning job.
 
@@ -1055,7 +1064,7 @@ class HyperparameterTuner(object):
             allowed_keys=estimator_names,
         )
 
-        for (estimator_name, estimator) in self.estimator_dict.items():
+        for estimator_name, estimator in self.estimator_dict.items():
             ins = inputs.get(estimator_name, None) if inputs is not None else None
             args = estimator_kwargs.get(estimator_name, {}) if estimator_kwargs is not None else {}
             self._prepare_estimator_for_tuning(estimator, ins, job_name, **args)
@@ -1263,10 +1272,10 @@ class HyperparameterTuner(object):
             objective_metric_name_dict[estimator_name] = training_details["TuningObjective"][
                 "MetricName"
             ]
-            hyperparameter_ranges_dict[
-                estimator_name
-            ] = cls._prepare_parameter_ranges_from_job_description(  # noqa: E501 # pylint: disable=line-too-long
-                training_details["HyperParameterRanges"]
+            hyperparameter_ranges_dict[estimator_name] = (
+                cls._prepare_parameter_ranges_from_job_description(  # noqa: E501 # pylint: disable=line-too-long
+                    training_details["HyperParameterRanges"]
+                )
             )
 
             metric_definitions = training_details["AlgorithmSpecification"].get(
@@ -1282,7 +1291,7 @@ class HyperparameterTuner(object):
             objective_metric_name_dict=objective_metric_name_dict,
             hyperparameter_ranges_dict=hyperparameter_ranges_dict,
             metric_definitions_dict=metric_definitions_dict,
-            **init_params
+            **init_params,
         )
 
     def deploy(
@@ -1297,7 +1306,7 @@ class HyperparameterTuner(object):
         model_name=None,
         kms_key=None,
         data_capture_config=None,
-        **kwargs
+        **kwargs,
     ):
         """Deploy the best trained or user specified model to an Amazon SageMaker endpoint.
 
@@ -1363,7 +1372,7 @@ class HyperparameterTuner(object):
             model_name=model_name,
             kms_key=kms_key,
             data_capture_config=data_capture_config,
-            **kwargs
+            **kwargs,
         )
 
     def stop_tuning_job(self):
@@ -2106,9 +2115,9 @@ class HyperparameterTuner(object):
         self.objective_metric_name_dict[estimator_name] = objective_metric_name
         self._hyperparameter_ranges_dict[estimator_name] = hyperparameter_ranges
         if hyperparameters_to_keep_static is not None:
-            self.hyperparameters_to_keep_static_dict[
-                estimator_name
-            ] = hyperparameters_to_keep_static
+            self.hyperparameters_to_keep_static_dict[estimator_name] = (
+                hyperparameters_to_keep_static
+            )
         if metric_definitions is not None:
             self.metric_definitions_dict[estimator_name] = metric_definitions
 
@@ -2185,9 +2194,9 @@ class _TuningJob(_Job):
             tuning_config["auto_parameters"] = tuner.auto_parameters
 
         if tuner.completion_criteria_config is not None:
-            tuning_config[
-                "completion_criteria_config"
-            ] = tuner.completion_criteria_config.to_input_req()
+            tuning_config["completion_criteria_config"] = (
+                tuner.completion_criteria_config.to_input_req()
+            )
 
         tuner_args = {
             "job_name": tuner._current_job_name,
@@ -2217,12 +2226,16 @@ class _TuningJob(_Job):
                     tuner.objective_type,
                     tuner.objective_metric_name_dict[estimator_name],
                     tuner.hyperparameter_ranges_dict()[estimator_name],
-                    tuner.instance_configs_dict.get(estimator_name, None)
-                    if tuner.instance_configs_dict is not None
-                    else None,
-                    tuner.auto_parameters_dict.get(estimator_name, None)
-                    if tuner.auto_parameters_dict is not None
-                    else None,
+                    (
+                        tuner.instance_configs_dict.get(estimator_name, None)
+                        if tuner.instance_configs_dict is not None
+                        else None
+                    ),
+                    (
+                        tuner.auto_parameters_dict.get(estimator_name, None)
+                        if tuner.auto_parameters_dict is not None
+                        else None
+                    ),
                 )
                 for estimator_name in sorted(tuner.estimator_dict.keys())
             ]
@@ -2298,9 +2311,9 @@ class _TuningJob(_Job):
             training_config["image_uri"] = estimator.training_image_uri()
 
         training_config["enable_network_isolation"] = estimator.enable_network_isolation()
-        training_config[
-            "encrypt_inter_container_traffic"
-        ] = estimator.encrypt_inter_container_traffic
+        training_config["encrypt_inter_container_traffic"] = (
+            estimator.encrypt_inter_container_traffic
+        )
 
         training_config["use_spot_instances"] = estimator.use_spot_instances
         training_config["checkpoint_s3_uri"] = estimator.checkpoint_s3_uri

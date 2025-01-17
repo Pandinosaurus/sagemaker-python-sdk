@@ -10,16 +10,25 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
+# pylint: skip-file
 """This module contains accessors related to SageMaker JumpStart."""
 from __future__ import absolute_import
 import functools
+import logging
 from typing import Any, Dict, List, Optional
 import boto3
 
 from sagemaker.deprecations import deprecated
-from sagemaker.jumpstart.types import JumpStartModelHeader, JumpStartModelSpecs
+from sagemaker.jumpstart.types import JumpStartModelHeader, JumpStartModelSpecs, HubContentType
+from sagemaker.jumpstart.enums import JumpStartModelType
 from sagemaker.jumpstart import cache
+from sagemaker.jumpstart.hub.utils import (
+    construct_hub_model_arn_from_inputs,
+    construct_hub_model_reference_arn_from_inputs,
+)
 from sagemaker.jumpstart.constants import JUMPSTART_DEFAULT_REGION_NAME
+from sagemaker.session import Session
+from sagemaker.jumpstart import constants
 
 
 class SageMakerSettings(object):
@@ -197,7 +206,9 @@ class JumpStartModelsAccessor(object):
 
     @staticmethod
     def _get_manifest(
-        region: str = JUMPSTART_DEFAULT_REGION_NAME, s3_client: Optional[boto3.client] = None
+        region: str = JUMPSTART_DEFAULT_REGION_NAME,
+        s3_client: Optional[boto3.client] = None,
+        model_type: JumpStartModelType = JumpStartModelType.OPEN_WEIGHTS,
     ) -> List[JumpStartModelHeader]:
         """Return entire JumpStart models manifest.
 
@@ -215,13 +226,19 @@ class JumpStartModelsAccessor(object):
             additional_kwargs.update({"s3_client": s3_client})
 
         cache_kwargs = JumpStartModelsAccessor._validate_and_mutate_region_cache_kwargs(
-            {**JumpStartModelsAccessor._cache_kwargs, **additional_kwargs}, region
+            {**JumpStartModelsAccessor._cache_kwargs, **additional_kwargs},
+            region,
         )
         JumpStartModelsAccessor._set_cache_and_region(region, cache_kwargs)
-        return JumpStartModelsAccessor._cache.get_manifest()  # type: ignore
+        return JumpStartModelsAccessor._cache.get_manifest(model_type)  # type: ignore
 
     @staticmethod
-    def get_model_header(region: str, model_id: str, version: str) -> JumpStartModelHeader:
+    def get_model_header(
+        region: str,
+        model_id: str,
+        version: str,
+        model_type: JumpStartModelType = JumpStartModelType.OPEN_WEIGHTS,
+    ) -> JumpStartModelHeader:
         """Returns model header from JumpStart models cache.
 
         Args:
@@ -234,12 +251,20 @@ class JumpStartModelsAccessor(object):
         )
         JumpStartModelsAccessor._set_cache_and_region(region, cache_kwargs)
         return JumpStartModelsAccessor._cache.get_header(  # type: ignore
-            model_id=model_id, semantic_version_str=version
+            model_id=model_id,
+            semantic_version_str=version,
+            model_type=model_type,
         )
 
     @staticmethod
     def get_model_specs(
-        region: str, model_id: str, version: str, s3_client: Optional[boto3.client] = None
+        region: str,
+        model_id: str,
+        version: str,
+        hub_arn: Optional[str] = None,
+        s3_client: Optional[boto3.client] = None,
+        model_type=JumpStartModelType.OPEN_WEIGHTS,
+        sagemaker_session: Session = constants.DEFAULT_JUMPSTART_SAGEMAKER_SESSION,
     ) -> JumpStartModelSpecs:
         """Returns model specs from JumpStart models cache.
 
@@ -255,12 +280,42 @@ class JumpStartModelsAccessor(object):
         if s3_client is not None:
             additional_kwargs.update({"s3_client": s3_client})
 
+        if hub_arn:
+            additional_kwargs.update({"sagemaker_session": sagemaker_session})
+
         cache_kwargs = JumpStartModelsAccessor._validate_and_mutate_region_cache_kwargs(
             {**JumpStartModelsAccessor._cache_kwargs, **additional_kwargs}
         )
         JumpStartModelsAccessor._set_cache_and_region(region, cache_kwargs)
+
+        if hub_arn:
+            try:
+                hub_model_arn = construct_hub_model_reference_arn_from_inputs(
+                    hub_arn=hub_arn, model_name=model_id, version=version
+                )
+                model_specs = JumpStartModelsAccessor._cache.get_hub_model_reference(
+                    hub_model_reference_arn=hub_model_arn
+                )
+                model_specs.set_hub_content_type(HubContentType.MODEL_REFERENCE)
+                return model_specs
+
+            except Exception as ex:
+                logging.info(
+                    "Received exeption while calling APIs for ContentType ModelReference, \
+                        retrying with ContentType Model: "
+                    + str(ex)
+                )
+                hub_model_arn = construct_hub_model_arn_from_inputs(
+                    hub_arn=hub_arn, model_name=model_id, version=version
+                )
+                model_specs = JumpStartModelsAccessor._cache.get_hub_model(
+                    hub_model_arn=hub_model_arn
+                )
+                model_specs.set_hub_content_type(HubContentType.MODEL)
+                return model_specs
+
         return JumpStartModelsAccessor._cache.get_specs(  # type: ignore
-            model_id=model_id, semantic_version_str=version
+            model_id=model_id, version_str=version, model_type=model_type
         )
 
     @staticmethod

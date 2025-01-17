@@ -130,9 +130,12 @@ printf "INFO: CONDA_PKGS_DIRS is set to '$CONDA_PKGS_DIRS'\\n"
 export PIP_CACHE_DIR=${{PERSISTENT_CACHE_DIR}}/sm_remotefunction_user_dependencies_cache/pip
 printf "INFO: PIP_CACHE_DIR is set to '$PIP_CACHE_DIR'\\n"
 
+printf "INFO: /opt/ml/input/config/resourceconfig.json:\\n"
+cat /opt/ml/input/config/resourceconfig.json
 
 printf "INFO: Bootstraping runtime environment.\\n"
 python /opt/ml/input/data/{RUNTIME_SCRIPTS_CHANNEL_NAME}/{BOOTSTRAP_SCRIPT_NAME} "$@"
+source /opt/ml/input/sm_training.env
 
 if [ -d {JOB_REMOTE_FUNCTION_WORKSPACE} ]
 then
@@ -155,10 +158,68 @@ then
     fi
 
     printf "INFO: Invoking remote function inside conda environment: $conda_env.\\n"
+    printf "INFO: $conda_exe run -n $conda_env python -m sagemaker.remote_function.invoke_function \\n"
     $conda_exe run -n $conda_env python -m sagemaker.remote_function.invoke_function "$@"
 else
     printf "INFO: No conda env provided. Invoking remote function\\n"
+    printf "INFO: python -m sagemaker.remote_function.invoke_function \\n"
     python -m sagemaker.remote_function.invoke_function "$@"
+fi
+"""
+
+ENTRYPOINT_TORCHRUN_SCRIPT = f"""
+#!/bin/bash
+
+# Entry point for bootstrapping runtime environment and invoking remote function with torchrun
+
+set -eu
+
+PERSISTENT_CACHE_DIR=${{SAGEMAKER_MANAGED_WARMPOOL_CACHE_DIRECTORY:-/opt/ml/cache}}
+export CONDA_PKGS_DIRS=${{PERSISTENT_CACHE_DIR}}/sm_remotefunction_user_dependencies_cache/conda/pkgs
+printf "INFO: CONDA_PKGS_DIRS is set to '$CONDA_PKGS_DIRS'\\n"
+export PIP_CACHE_DIR=${{PERSISTENT_CACHE_DIR}}/sm_remotefunction_user_dependencies_cache/pip
+printf "INFO: PIP_CACHE_DIR is set to '$PIP_CACHE_DIR'\\n"
+
+printf "INFO: /opt/ml/input/config/resourceconfig.json:\\n"
+cat /opt/ml/input/config/resourceconfig.json
+
+printf "INFO: Bootstraping runtime environment.\\n"
+python /opt/ml/input/data/{RUNTIME_SCRIPTS_CHANNEL_NAME}/{BOOTSTRAP_SCRIPT_NAME} "$@"
+source /opt/ml/input/sm_training.env
+
+if [ -d {JOB_REMOTE_FUNCTION_WORKSPACE} ]
+then
+    if [ -f "remote_function_conda_env.txt" ]
+    then
+        cp remote_function_conda_env.txt {JOB_REMOTE_FUNCTION_WORKSPACE}/remote_function_conda_env.txt
+    fi
+    printf "INFO: Changing workspace to {JOB_REMOTE_FUNCTION_WORKSPACE}.\\n"
+    cd {JOB_REMOTE_FUNCTION_WORKSPACE}
+fi
+
+if [ -f "remote_function_conda_env.txt" ]
+then
+    conda_env=$(cat remote_function_conda_env.txt)
+
+    if which mamba >/dev/null; then
+        conda_exe="mamba"
+    else
+        conda_exe="conda"
+    fi
+
+    printf "INFO: Invoking remote function with torchrun inside conda environment: $conda_env.\\n"
+    printf "INFO: $conda_exe run -n $conda_env torchrun --nnodes $SM_HOST_COUNT --nproc_per_node $SM_NPROC_PER_NODE \
+    --master_addr $SM_MASTER_ADDR --master_port $SM_MASTER_PORT --node_rank $SM_CURRENT_HOST_RANK \
+    -m sagemaker.remote_function.invoke_function \\n"
+    $conda_exe run -n $conda_env torchrun --nnodes $SM_HOST_COUNT --nproc_per_node $SM_NPROC_PER_NODE \
+    --master_addr $SM_MASTER_ADDR --master_port $SM_MASTER_PORT --node_rank $SM_CURRENT_HOST_RANK \
+    -m sagemaker.remote_function.invoke_function "$@"
+else
+    printf "INFO: No conda env provided. Invoking remote function with torchrun\\n"
+    printf "INFO: torchrun --nnodes $SM_HOST_COUNT --nproc_per_node $SM_NPROC_PER_NODE --master_addr $SM_MASTER_ADDR \
+    --master_port $SM_MASTER_PORT --node_rank $SM_CURRENT_HOST_RANK -m sagemaker.remote_function.invoke_function \\n"
+    torchrun --nnodes $SM_HOST_COUNT --nproc_per_node $SM_NPROC_PER_NODE --master_addr $SM_MASTER_ADDR \
+    --master_port $SM_MASTER_PORT --node_rank $SM_CURRENT_HOST_RANK -m sagemaker.remote_function.invoke_function "$@"
 fi
 """
 
@@ -216,6 +277,8 @@ class _JobSettings:
         spark_config: SparkConfig = None,
         use_spot_instances=False,
         max_wait_time_in_seconds=None,
+        use_torchrun: bool = False,
+        nproc_per_node: Optional[int] = None,
     ):
         """Initialize a _JobSettings instance which configures the remote job.
 
@@ -397,6 +460,13 @@ class _JobSettings:
             max_wait_time_in_seconds (int): Timeout in seconds waiting for spot training job.
               After this amount of time Amazon SageMaker will stop waiting for managed spot
               training job to complete. Defaults to ``None``.
+
+            use_torchrun (bool): Specifies whether to use torchrun for distributed training.
+              Defaults to ``False``.
+
+            nproc_per_node (Optional int): Specifies the number of processes per node for
+              distributed training. Defaults to ``None``.
+              This is defined automatically configured on the instance type.
         """
         self.sagemaker_session = sagemaker_session or Session()
         self.environment_variables = resolve_value_from_config(
@@ -555,6 +625,9 @@ class _JobSettings:
         tags = format_tags(tags)
         self.tags = self.sagemaker_session._append_sagemaker_config_tags(tags, REMOTE_FUNCTION_TAGS)
 
+        self.use_torchrun = use_torchrun
+        self.nproc_per_node = nproc_per_node
+
     @staticmethod
     def _get_default_image(session):
         """Return Studio notebook image, if in Studio env. Else, base python.
@@ -681,6 +754,7 @@ class _Job:
         )
 
         logger.info("Creating job: %s", job_name)
+
         job_settings.sagemaker_session.sagemaker_client.create_training_job(**training_job_request)
 
         return _Job(
@@ -863,9 +937,9 @@ class _Job:
             request_dict["EnableNetworkIsolation"] = job_settings.enable_network_isolation
 
         if job_settings.encrypt_inter_container_traffic is not None:
-            request_dict[
-                "EnableInterContainerTrafficEncryption"
-            ] = job_settings.encrypt_inter_container_traffic
+            request_dict["EnableInterContainerTrafficEncryption"] = (
+                job_settings.encrypt_inter_container_traffic
+            )
 
         if job_settings.vpc_config:
             request_dict["VpcConfig"] = job_settings.vpc_config
@@ -876,6 +950,7 @@ class _Job:
         request_dict["Environment"].update({"REMOTE_FUNCTION_SECRET_KEY": hmac_key})
 
         extended_request = _extend_spark_config_to_request(request_dict, job_settings, s3_base_uri)
+        extended_request = _extend_torchrun_to_request(extended_request, job_settings)
 
         return extended_request
 
@@ -951,7 +1026,12 @@ class _Job:
 
 
 def _prepare_and_upload_runtime_scripts(
-    spark_config: SparkConfig, s3_base_uri: str, s3_kms_key: str, sagemaker_session: Session
+    spark_config: SparkConfig,
+    s3_base_uri: str,
+    s3_kms_key: str,
+    sagemaker_session: Session,
+    use_torchrun: bool = False,
+    nproc_per_node: Optional[int] = None,
 ):
     """Copy runtime scripts to a folder and upload to S3.
 
@@ -967,6 +1047,10 @@ def _prepare_and_upload_runtime_scripts(
         s3_kms_key (str): kms key used to encrypt the files uploaded to S3.
 
         sagemaker_session (str): SageMaker boto client session.
+
+        use_torchrun (bool): Whether to use torchrun or not.
+
+        nproc_per_node (Optional[int]): Number of processes per node
     """
 
     from sagemaker.workflow.utilities import load_step_compilation_context
@@ -987,6 +1071,14 @@ def _prepare_and_upload_runtime_scripts(
                 os.path.dirname(__file__), "runtime_environment", SPARK_APP_SCRIPT_NAME
             )
             shutil.copy2(spark_script_path, bootstrap_scripts)
+
+        if use_torchrun:
+            entry_point_script = ENTRYPOINT_TORCHRUN_SCRIPT
+
+            if nproc_per_node is not None and nproc_per_node > 0:
+                entry_point_script = entry_point_script.replace(
+                    "$SM_NPROC_PER_NODE", str(nproc_per_node)
+                )
 
         with open(entrypoint_script_path, "w", newline="\n") as file:
             file.writelines(entry_point_script)
@@ -1025,6 +1117,8 @@ def _generate_input_data_config(job_settings: _JobSettings, s3_base_uri: str):
         s3_base_uri=s3_base_uri,
         s3_kms_key=job_settings.s3_kms_key,
         sagemaker_session=job_settings.sagemaker_session,
+        use_torchrun=job_settings.use_torchrun,
+        nproc_per_node=job_settings.nproc_per_node,
     )
 
     input_data_config = [
@@ -1080,9 +1174,11 @@ def _generate_input_data_config(job_settings: _JobSettings, s3_base_uri: str):
     if user_workspace_s3uri:
         input_data_config.append(
             dict(
-                ChannelName=REMOTE_FUNCTION_WORKSPACE
-                if not step_compilation_context
-                else step_compilation_context.pipeline_build_time,
+                ChannelName=(
+                    REMOTE_FUNCTION_WORKSPACE
+                    if not step_compilation_context
+                    else step_compilation_context.pipeline_build_time
+                ),
                 DataSource={
                     "S3DataSource": {
                         "S3Uri": user_workspace_s3uri,
@@ -1361,6 +1457,35 @@ def _upload_serialized_spark_configuration(
     logger.info("Uploaded spark configuration json %s to %s", configuration, config_file_s3_uri)
 
     return config_file_s3_uri
+
+
+def _extend_torchrun_to_request(
+    request_dict: Dict,
+    job_settings: _JobSettings,
+) -> Dict:
+    """Extend the create training job request with torchrun configuration.
+
+    Args:
+        request_dict (Dict): create training job request dict.
+        job_settings (_JobSettings): the job settings.
+    """
+    use_torchrun = job_settings.use_torchrun
+    instance_count = job_settings.instance_count
+
+    if not use_torchrun:
+        return request_dict
+
+    if instance_count == 1:
+        return request_dict
+
+    extended_request = request_dict.copy()
+
+    for input_channel in extended_request["InputDataConfig"]:
+        s3_data_source = input_channel["DataSource"].get("S3DataSource", None)
+        if s3_data_source:
+            s3_data_source["S3DataDistributionType"] = "FullyReplicated"
+
+    return extended_request
 
 
 def _extend_spark_config_to_request(

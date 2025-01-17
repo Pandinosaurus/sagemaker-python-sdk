@@ -26,6 +26,7 @@ This script uses custom loops to train Mnist model and saves the checkpoints usi
 checkpoint manager.
 """
 
+
 # define a model
 class LeNet(tf.keras.Model):
     def __init__(self):
@@ -197,7 +198,10 @@ def main(args):
 
         if args.current_host == args.hosts[0]:
             ckpt_manager.save()
-            net.save("/opt/ml/model/1")
+            if int(tf_major) > 2 or (int(tf_major) == 2 and int(tf_minor) >= 16):
+                net.export("/opt/ml/model/1")
+            else:
+                net.save("/opt/ml/model/1")
 
 
 if __name__ == "__main__":

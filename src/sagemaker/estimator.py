@@ -68,6 +68,7 @@ from sagemaker.inputs import TrainingInput, FileSystemInput
 from sagemaker.interactive_apps import SupportedInteractiveAppTypes
 from sagemaker.interactive_apps.tensorboard import TensorBoardApp
 from sagemaker.instance_group import InstanceGroup
+from sagemaker.model_card.model_card import ModelCard, TrainingDetails
 from sagemaker.utils import instance_supports_kms
 from sagemaker.job import _Job
 from sagemaker.jumpstart.utils import (
@@ -105,6 +106,8 @@ from sagemaker.workflow import is_pipeline_variable
 from sagemaker.workflow.entities import PipelineVariable
 from sagemaker.workflow.parameters import ParameterString
 from sagemaker.workflow.pipeline_context import PipelineSession, runnable_by_pipeline
+from sagemaker.telemetry.telemetry_logging import _telemetry_emitter
+from sagemaker.telemetry.constants import Feature
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +184,8 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         container_arguments: Optional[List[str]] = None,
         disable_output_compression: bool = False,
         enable_remote_debug: Optional[Union[bool, PipelineVariable]] = None,
+        enable_session_tag_chaining: Optional[Union[bool, PipelineVariable]] = None,
+        training_plan: Optional[Union[str, PipelineVariable]] = None,
         **kwargs,
     ):
         """Initialize an ``EstimatorBase`` instance.
@@ -273,7 +278,10 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
                 AWS services needed. If not specified, the estimator creates one
                 using the default AWS configuration chain.
             tags (Optional[Tags]):
-                Tags for labeling a training job. For more, see
+                Tags for labeling a training job. These won't be propagated to Models,
+                Endpoints during :meth:`~sagemaker.estimator.EstimatorBase.deploy`. The
+                :meth:`~sagemaker.estimator.EstimatorBase.deploy` takes in a seperate
+                tags parameter. For more on tags, see
                 https://docs.aws.amazon.com/sagemaker/latest/dg/API_Tag.html.
             subnets (list[str] or list[PipelineVariable]): List of subnet ids. If not
                 specified training job will be created without VPC config.
@@ -544,7 +552,11 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             enable_infra_check (bool or PipelineVariable): Optional.
                 Specifies whether it is running Sagemaker built-in infra check jobs.
             enable_remote_debug (bool or PipelineVariable): Optional.
-                Specifies whether RemoteDebug is enabled for the training job
+                Specifies whether RemoteDebug is enabled for the training job.
+            enable_session_tag_chaining (bool or PipelineVariable): Optional.
+                Specifies whether SessionTagChaining is enabled for the training job.
+            training_plan (str or PipelineVariable): Optional.
+                Specifies which training plan arn to use for the training job
         """
         instance_count = renamed_kwargs(
             "train_instance_count", "instance_count", instance_count, kwargs
@@ -583,25 +595,36 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         self.dependencies = dependencies or []
         self.uploaded_code: Optional[UploadedCode] = None
 
-        # Check that the user properly sets both subnet and secutiry_groupe_ids
+        # Check that the user properly sets both subnet and security_group_ids
         if (
             subnets is not None
             and security_group_ids is None
             or security_group_ids is not None
             and subnets is None
         ):
+            troubleshooting = (
+                "Refer to this documentation on using custom VPC: "
+                "https://sagemaker.readthedocs.io/en/v2.24.0/overview.html"
+                "#secure-training-and-inference-with-vpc"
+            )
+            logger.error("Check troubleshooting guide for common errors: %s", troubleshooting)
+
             raise RuntimeError(
                 "When setting up custom VPC, both subnets and security_group_ids must be set"
             )
 
         if self.instance_type in ("local", "local_gpu"):
             if self.instance_type == "local_gpu" and self.instance_count > 1:
-                raise RuntimeError("Distributed Training in Local GPU is not supported")
+                raise RuntimeError(
+                    "Distributed Training in Local GPU is not supported."
+                    " Set instance_count to 1."
+                )
             self.sagemaker_session = sagemaker_session or LocalSession()
             if not isinstance(self.sagemaker_session, sagemaker.local.LocalSession):
                 raise RuntimeError(
                     "instance_type local or local_gpu is only supported with an"
-                    "instance of LocalSession"
+                    "instance of LocalSession. More details on local mode: "
+                    "https://sagemaker.readthedocs.io/en/stable/overview.html#local-mode"
                 )
         else:
             self.sagemaker_session = sagemaker_session or Session()
@@ -624,7 +647,11 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             and not is_pipeline_variable(output_path)
             and output_path.startswith("file://")
         ):
-            raise RuntimeError("file:// output paths are only supported in Local Mode")
+            raise RuntimeError(
+                "The 'file://' output paths are only supported when using Local Mode. "
+                "To resolve this issue, ensure you're running in Local Mode with a LocalSession, "
+                "or use an 's3://' output path for jobs running on SageMaker instances."
+            )
         self.output_path = output_path
         self.latest_training_job = None
         self.jobs = []
@@ -639,7 +666,12 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             # Now we marked that as Optional because we can fetch it from SageMakerConfig
             # Because of marking that parameter as optional, we should validate if it is None, even
             # after fetching the config.
-            raise ValueError("An AWS IAM role is required to create an estimator.")
+            raise ValueError(
+                "An AWS IAM role is required to create an estimator. "
+                "Please provide a valid `role` argument with the ARN of an IAM role"
+                " that has the necessary SageMaker permissions."
+            )
+
         self.output_kms_key = resolve_value_from_config(
             output_kms_key, TRAINING_JOB_KMS_KEY_ID_PATH, sagemaker_session=self.sagemaker_session
         )
@@ -733,8 +765,7 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
 
         self.tensorboard_output_config = tensorboard_output_config
 
-        self.debugger_rule_configs = None
-        self.collection_configs = None
+        self.debugger_rule_configs, self.collection_configs = None, None
 
         self.enable_sagemaker_metrics = enable_sagemaker_metrics
 
@@ -745,6 +776,7 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             sagemaker_session=self.sagemaker_session,
         )
 
+        self.profiler_rule_configs, self.profiler_rules = None, None
         self.profiler_config = profiler_config
         self.disable_profiler = resolve_value_from_config(
             direct_input=disable_profiler,
@@ -767,8 +799,6 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         ) or _instance_type_supports_profiler(self.instance_type):
             self.disable_profiler = True
 
-        self.profiler_rule_configs = None
-        self.profiler_rules = None
         self.debugger_rules = None
         self.disable_output_compression = disable_output_compression
         validate_source_code_input_against_pipeline_variables(
@@ -778,12 +808,16 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             enable_network_isolation=self._enable_network_isolation,
         )
 
+        self.training_plan = training_plan
+
         # Internal flag
         self._is_output_path_set_from_default_bucket_and_prefix = False
 
         self.tensorboard_app = TensorBoardApp(region=self.sagemaker_session.boto_region_name)
 
         self._enable_remote_debug = enable_remote_debug
+
+        self._enable_session_tag_chaining = enable_session_tag_chaining
 
     @abstractmethod
     def training_image_uri(self):
@@ -1267,6 +1301,7 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             )
         return None
 
+    @_telemetry_emitter(feature=Feature.ESTIMATOR, func_name="estimator.fit")
     @runnable_by_pipeline
     def fit(
         self,
@@ -1337,8 +1372,20 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         experiment_config = check_and_get_run_experiment_config(experiment_config)
         self.latest_training_job = _TrainingJob.start_new(self, inputs, experiment_config)
         self.jobs.append(self.latest_training_job)
+        forward_to_mlflow_tracking_server = False
+        if os.environ.get("MLFLOW_TRACKING_URI") and self.enable_network_isolation():
+            wait = True
+            forward_to_mlflow_tracking_server = True
         if wait:
             self.latest_training_job.wait(logs=logs)
+        try:
+            if forward_to_mlflow_tracking_server:
+                from sagemaker.mlflow.forward_sagemaker_metrics import log_sagemaker_job_to_mlflow
+
+                log_sagemaker_job_to_mlflow(self.latest_training_job.name)
+        except ImportError:
+            if forward_to_mlflow_tracking_server:
+                raise ValueError("Unable to import mlflow, check if sagemaker-mlflow is installed")
 
     def _compilation_job_name(self):
         """Placeholder docstring"""
@@ -1718,6 +1765,9 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         nearest_model_name=None,
         data_input_configuration=None,
         skip_model_validation=None,
+        source_uri=None,
+        model_life_cycle=None,
+        model_card=None,
         **kwargs,
     ):
         """Creates a model package for creating SageMaker models or listing on Marketplace.
@@ -1765,6 +1815,10 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             data_input_configuration (str): Input object for the model (default: None).
             skip_model_validation (str): Indicates if you want to skip model validation.
                 Values can be "All" or "None" (default: None).
+            source_uri (str): The URI of the source for the model package (default: None).
+            model_card (ModeCard or ModelPackageModelCard): document contains qualitative and
+                quantitative information about a model (default: None).
+            model_life_cycle (ModelLifeCycle): ModelLifeCycle object (default: None).
             **kwargs: Passed to invocation of ``create_model()``. Implementations may customize
                 ``create_model()`` to accept ``**kwargs`` to customize model creation during
                 deploy. For more, see the implementation docs.
@@ -1784,8 +1838,17 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
         else:
             if "model_kms_key" not in kwargs:
                 kwargs["model_kms_key"] = self.output_kms_key
-            model = self.create_model(image_uri=image_uri, **kwargs)
+            model = self.create_model(image_uri=image_uri, name=model_name, **kwargs)
         model.name = model_name
+        if self.model_data is not None and model_card is None:
+            training_details = TrainingDetails.from_model_s3_artifacts(
+                model_artifacts=[self.model_data], sagemaker_session=self.sagemaker_session
+            )
+            model_card = ModelCard(
+                name="estimator_card",
+                training_details=training_details,
+                sagemaker_session=self.sagemaker_session,
+            )
         return model.register(
             content_types,
             response_types,
@@ -1809,6 +1872,9 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             nearest_model_name=nearest_model_name,
             data_input_configuration=data_input_configuration,
             skip_model_validation=skip_model_validation,
+            source_uri=source_uri,
+            model_card=model_card,
+            model_life_cycle=model_life_cycle,
         )
 
     @property
@@ -1830,6 +1896,8 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             if compression_type not in {"GZIP", "NONE"}:
                 raise ValueError(
                     f'Unrecognized training job output data compression type "{compression_type}"'
+                    '. Please specify either "GZIP" or "NONE" as valid options for '
+                    "the compression type."
                 )
             # model data is in uncompressed form NOTE SageMaker Hosting mandates presence of
             # trailing forward slash in S3 model data URI, so append one if necessary.
@@ -1894,6 +1962,9 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             init_params["keep_alive_period_in_seconds"] = job_details["ResourceConfig"][
                 "KeepAlivePeriodInSeconds"
             ]
+
+        if "TrainingPlanArn" in job_details["ResourceConfig"]:
+            init_params["training_plan"] = job_details["ResourceConfig"]["TrainingPlanArn"]
 
         has_hps = "HyperParameters" in job_details
         init_params["hyperparameters"] = job_details["HyperParameters"] if has_hps else {}
@@ -2315,6 +2386,14 @@ class EstimatorBase(with_metaclass(ABCMeta, object)):  # pylint: disable=too-man
             else {"EnableRemoteDebug": self._enable_remote_debug}
         )
 
+    def get_session_chaining_config(self):
+        """dict: Return the configuration of SessionChaining"""
+        return (
+            None
+            if self._enable_session_tag_chaining is None
+            else {"EnableSessionTagChaining": self._enable_session_tag_chaining}
+        )
+
     def enable_remote_debug(self):
         """Enable remote debug for a training job."""
         self._update_remote_debug(True)
@@ -2431,6 +2510,7 @@ class _TrainingJob(_Job):
         """
         train_args = cls._get_train_args(estimator, inputs, experiment_config)
 
+        logger.debug("Train args after processing defaults: %s", train_args)
         estimator.sagemaker_session.train(**train_args)
 
         return cls(estimator.sagemaker_session, estimator._current_job_name)
@@ -2496,7 +2576,13 @@ class _TrainingJob(_Job):
 
         # enable_network_isolation may be a pipeline variable place holder object
         # which is parsed in execution time
-        if estimator.enable_network_isolation():
+
+        # Should be defaulted to False
+        train_args["enable_network_isolation"] = False
+
+        # Only change it if it's explicitly passed so the sagemaker config
+        # doesn't override the kwarg.
+        if estimator.enable_network_isolation() is not None:
             train_args["enable_network_isolation"] = estimator.enable_network_isolation()
 
         if estimator.max_retry_attempts is not None:
@@ -2529,9 +2615,9 @@ class _TrainingJob(_Job):
         # which is parsed in execution time
         # This does not check config because the EstimatorBase constuctor already did that check
         if estimator.encrypt_inter_container_traffic:
-            train_args[
-                "encrypt_inter_container_traffic"
-            ] = estimator.encrypt_inter_container_traffic
+            train_args["encrypt_inter_container_traffic"] = (
+                estimator.encrypt_inter_container_traffic
+            )
 
         if isinstance(estimator, sagemaker.algorithm.AlgorithmEstimator):
             train_args["algorithm_arn"] = estimator.algorithm_arn
@@ -2546,9 +2632,9 @@ class _TrainingJob(_Job):
             train_args["debugger_hook_config"] = estimator.debugger_hook_config._to_request_dict()
 
         if estimator.tensorboard_output_config:
-            train_args[
-                "tensorboard_output_config"
-            ] = estimator.tensorboard_output_config._to_request_dict()
+            train_args["tensorboard_output_config"] = (
+                estimator.tensorboard_output_config._to_request_dict()
+            )
 
         cls._add_spot_checkpoint_args(local_mode, estimator, train_args)
 
@@ -2563,6 +2649,9 @@ class _TrainingJob(_Job):
 
         if estimator.get_remote_debug_config() is not None:
             train_args["remote_debug_config"] = estimator.get_remote_debug_config()
+
+        if estimator.get_session_chaining_config() is not None:
+            train_args["session_chaining_config"] = estimator.get_session_chaining_config()
 
         return train_args
 
@@ -2756,6 +2845,8 @@ class Estimator(EstimatorBase):
         disable_output_compression: bool = False,
         enable_infra_check: Optional[Union[bool, PipelineVariable]] = None,
         enable_remote_debug: Optional[Union[bool, PipelineVariable]] = None,
+        enable_session_tag_chaining: Optional[Union[bool, PipelineVariable]] = None,
+        training_plan: Optional[Union[str, PipelineVariable]] = None,
         **kwargs,
     ):
         """Initialize an ``Estimator`` instance.
@@ -3119,6 +3210,10 @@ class Estimator(EstimatorBase):
                 Specifies whether it is running Sagemaker built-in infra check jobs.
             enable_remote_debug (bool or PipelineVariable): Optional.
                 Specifies whether RemoteDebug is enabled for the training job
+            enable_session_tag_chaining (bool or PipelineVariable): Optional.
+                 Specifies whether SessionTagChaining is enabled for the training job
+            training_plan (str or PipelineVariable): Optional.
+                Specifies which training plan arn to use for the training job
         """
         self.image_uri = image_uri
         self._hyperparameters = hyperparameters.copy() if hyperparameters else {}
@@ -3171,6 +3266,8 @@ class Estimator(EstimatorBase):
             container_arguments=container_arguments,
             disable_output_compression=disable_output_compression,
             enable_remote_debug=enable_remote_debug,
+            enable_session_tag_chaining=enable_session_tag_chaining,
+            training_plan=training_plan,
             **kwargs,
         )
 
@@ -3282,10 +3379,7 @@ class Framework(EstimatorBase):
     """
 
     _framework_name = None
-    UNSUPPORTED_DLC_IMAGE_FOR_SM_PARALLELISM = (
-        "2.0.1-gpu-py310-cu121",
-        "2.0-gpu-py310-cu121",
-    )
+    UNSUPPORTED_DLC_IMAGE_FOR_SM_PARALLELISM = ("2.0.1-gpu-py310-cu121",)
 
     def __init__(
         self,
